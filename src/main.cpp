@@ -3,21 +3,24 @@
 #include <PubSubClient.h>
 #include <WiFi.h>
 #include <WiFiManager.h>
+#include <WiFiUdp.h>
 #include <driver/gpio.h>
 #include <time.h>
 
 constexpr int PIN_COIL_A = 4;
 constexpr int PIN_COIL_B = 5;
-constexpr uint32_t PULSE_MS = 200;
-constexpr uint32_t MINUTE_MS = 60000;
-constexpr uint8_t TICKS_PER_MINUTE = 60;
+constexpr uint32_t PULSE_MS = 30;
+constexpr uint16_t PULSES_PER_REVOLUTION = 960;
+constexpr uint16_t PULSES_PER_SECOND = PULSES_PER_REVOLUTION / 60;
 
-// Catch-up ticks run faster to reach the current second quickly on boot.
-constexpr uint32_t CATCHUP_TICK_MS = 50;
+// Total time for one pulse cycle (energize + pause) per mode.
+constexpr uint32_t STEADY_CYCLE_MS = 62;
+constexpr uint32_t RUSH_CYCLE_MS = 58;
+
+// Catch-up pulses run as fast as reliably possible.
+constexpr uint32_t CATCHUP_CYCLE_MS = 32;
 
 constexpr char NTP_SERVER[] = "pool.ntp.org";
-// UTC offset in seconds. Doesn't matter for tick timing, but needed for
-// correct minute-boundary alignment if you care about local time.
 constexpr long UTC_OFFSET_SECONDS = 0;
 
 // --- MQTT ---
@@ -27,8 +30,8 @@ constexpr char MQTT_TOPIC_MODE_STATE[] = "clock/mode/state";
 constexpr uint16_t MQTT_DEFAULT_PORT = 1883;
 constexpr uint32_t MQTT_RECONNECT_INTERVAL_MS = 5000;
 
-// Broker host/port are stored in flash via Preferences and configured through
-// WiFiManager's captive portal on first boot.
+constexpr uint16_t UDP_LOG_PORT = 37243;
+
 char mqtt_host[64] = "";
 uint16_t mqtt_port = MQTT_DEFAULT_PORT;
 
@@ -41,33 +44,64 @@ uint32_t last_mqtt_reconnect_attempt_ms = 0;
 
 enum class TickMode : uint8_t {
   steady,
-  random_balanced,
-  rush_then_wait,
+  rush_wait,
 };
 
-TickMode current_mode = TickMode::random_balanced;
-// Set by the MQTT callback, applied at the next minute boundary.
-TickMode pending_mode = TickMode::random_balanced;
+TickMode current_mode = TickMode::rush_wait;
+TickMode pending_mode = TickMode::rush_wait;
 bool mode_change_pending = false;
-
-// --- Random balanced mode config ---
-
-constexpr uint32_t MIN_INTERVAL_MS = 500;
-constexpr uint32_t MAX_INTERVAL_MS = 1500;
-
-// --- Rush-then-wait mode config ---
-
-constexpr uint32_t RUSH_INTERVAL_MS = 750;
 
 // --- State ---
 
 bool polarity = false;
-uint32_t next_tick_ms = 0;
-uint8_t tick_index = 0;
-uint32_t intervals[TICKS_PER_MINUTE];
+uint16_t pulse_index = 0;
 
-// Tracks where the second hand currently points (0-59).
-uint8_t hand_position = 0;
+// When stopped, the loop does nothing. Used to manually position the hand
+// before restarting at a minute boundary.
+bool stopped = false;
+
+// When true, the clock will start sweeping at the next minute boundary
+// (i.e. when getMsIntoMinute() wraps past 0).
+bool start_at_minute_pending = false;
+
+// When true, the clock will stop after the current revolution completes
+// (at pulse 960, i.e. the hand is at 12 o'clock).
+bool stop_at_top_pending = false;
+
+// The millis() timestamp of the current minute boundary. All pulse scheduling
+// is relative to this, so timing stays locked to NTP regardless of loop jitter.
+uint32_t minute_start_ms = 0;
+
+// True while we're in the idle gap between finishing the revolution and the
+// next minute boundary.
+bool waiting_for_minute = false;
+
+// --- Logging ---
+
+static void logMessage(const char* message) {
+  Serial.println(message);
+
+  if (WiFi.status() != WL_CONNECTED) {
+    return;
+  }
+
+  WiFiUDP udp;
+  IPAddress broadcast_ip(255, 255, 255, 255);
+  String packet = "(" + String(millis()) + " - " +
+                  WiFi.localIP().toString() + "): " + message;
+  udp.beginPacket(broadcast_ip, UDP_LOG_PORT);
+  udp.write((const uint8_t*)packet.c_str(), packet.length());
+  udp.endPacket();
+}
+
+static void logMessagef(const char* format, ...) {
+  char buffer[256];
+  va_list args;
+  va_start(args, format);
+  vsnprintf(buffer, sizeof(buffer), format, args);
+  va_end(args);
+  logMessage(buffer);
+}
 
 // --- Mode name helpers ---
 
@@ -75,10 +109,8 @@ static const char* modeToString(TickMode mode) {
   switch (mode) {
     case TickMode::steady:
       return "steady";
-    case TickMode::random_balanced:
-      return "random_balanced";
-    case TickMode::rush_then_wait:
-      return "rush_then_wait";
+    case TickMode::rush_wait:
+      return "rush_wait";
   }
   return "unknown";
 }
@@ -88,12 +120,8 @@ static bool stringToMode(const char* str, TickMode& out) {
     out = TickMode::steady;
     return true;
   }
-  if (strcmp(str, "random_balanced") == 0) {
-    out = TickMode::random_balanced;
-    return true;
-  }
-  if (strcmp(str, "rush_then_wait") == 0) {
-    out = TickMode::rush_then_wait;
+  if (strcmp(str, "rush_wait") == 0) {
+    out = TickMode::rush_wait;
     return true;
   }
   return false;
@@ -106,7 +134,7 @@ static void setCoilIdle() {
   digitalWrite(PIN_COIL_B, LOW);
 }
 
-static void tickOnce() {
+static void pulseOnce() {
   if (polarity) {
     digitalWrite(PIN_COIL_A, HIGH);
     digitalWrite(PIN_COIL_B, LOW);
@@ -118,63 +146,17 @@ static void tickOnce() {
   delay(PULSE_MS);
   setCoilIdle();
   polarity = !polarity;
-  hand_position = (hand_position + 1) % 60;
+  pulse_index++;
 }
 
-// --- Interval generation ---
-
-static void generateSteadyIntervals() {
-  for (uint8_t i = 0; i < TICKS_PER_MINUTE; i++) {
-    intervals[i] = 1000;
-  }
-}
-
-static void generateRandomBalancedIntervals() {
-  uint32_t sum = 0;
-  for (uint8_t i = 0; i < TICKS_PER_MINUTE; i++) {
-    intervals[i] = random(MIN_INTERVAL_MS, MAX_INTERVAL_MS + 1);
-    sum += intervals[i];
-  }
-
-  // Distribute the error across random ticks so the sum is exactly 60000 ms.
-  int32_t error = (int32_t)sum - (int32_t)MINUTE_MS;
-  while (error != 0) {
-    uint8_t index = random(TICKS_PER_MINUTE);
-    if (error > 0) {
-      uint32_t reduction = min((uint32_t)error,
-                               intervals[index] - MIN_INTERVAL_MS);
-      intervals[index] -= reduction;
-      error -= reduction;
-    } else {
-      uint32_t increase = min((uint32_t)(-error),
-                              MAX_INTERVAL_MS - intervals[index]);
-      intervals[index] += increase;
-      error += increase;
-    }
-  }
-}
-
-static void generateRushThenWaitIntervals() {
-  uint32_t rush_total = 0;
-  for (uint8_t i = 0; i < TICKS_PER_MINUTE - 1; i++) {
-    intervals[i] = RUSH_INTERVAL_MS;
-    rush_total += RUSH_INTERVAL_MS;
-  }
-  intervals[TICKS_PER_MINUTE - 1] = MINUTE_MS - rush_total;
-}
-
-static void generateIntervals() {
+static uint32_t getCycleMs() {
   switch (current_mode) {
     case TickMode::steady:
-      generateSteadyIntervals();
-      break;
-    case TickMode::random_balanced:
-      generateRandomBalancedIntervals();
-      break;
-    case TickMode::rush_then_wait:
-      generateRushThenWaitIntervals();
-      break;
+      return STEADY_CYCLE_MS;
+    case TickMode::rush_wait:
+      return RUSH_CYCLE_MS;
   }
+  return STEADY_CYCLE_MS;
 }
 
 // --- NTP ---
@@ -198,13 +180,25 @@ static uint8_t getCurrentSecond() {
   return timeinfo.tm_sec;
 }
 
-// Rapidly tick the motor to advance the hand from its current position to the
-// target second. This runs at boot after NTP sync so the hand catches up to
-// real time.
-static void catchUpToSecond(uint8_t target_second) {
-  while (hand_position != target_second) {
-    tickOnce();
-    delay(CATCHUP_TICK_MS);
+// Returns how many milliseconds have elapsed since the top of the current
+// minute, according to NTP.
+static uint32_t getMsIntoMinute() {
+  struct timeval tv;
+  gettimeofday(&tv, nullptr);
+  struct tm timeinfo;
+  localtime_r(&tv.tv_sec, &timeinfo);
+  return (uint32_t)timeinfo.tm_sec * 1000 + (uint32_t)(tv.tv_usec / 1000);
+}
+
+// Rapidly pulse the motor to advance the hand to the target pulse position.
+// Used at boot after NTP sync so the hand catches up to real time.
+static void catchUpToPulse(uint16_t target_pulse) {
+  while (pulse_index < target_pulse) {
+    pulseOnce();
+    uint32_t pause_ms = CATCHUP_CYCLE_MS > PULSE_MS ? CATCHUP_CYCLE_MS - PULSE_MS : 0;
+    if (pause_ms > 0) {
+      delay(pause_ms);
+    }
   }
 }
 
@@ -227,13 +221,44 @@ static void onMqttMessage(char* topic, byte* payload, unsigned int length) {
   memcpy(buffer, payload, copy_length);
   buffer[copy_length] = '\0';
 
+  if (strcmp(buffer, "stop") == 0) {
+    stopped = true;
+    start_at_minute_pending = false;
+    logMessage("Clock stopped.");
+    return;
+  }
+
+  if (strcmp(buffer, "start") == 0) {
+    stopped = false;
+    start_at_minute_pending = false;
+    pulse_index = 0;
+    waiting_for_minute = false;
+    minute_start_ms = millis();
+    logMessage("Clock started immediately.");
+    return;
+  }
+
+  if (strcmp(buffer, "start_at_minute") == 0) {
+    start_at_minute_pending = true;
+    stop_at_top_pending = false;
+    logMessage("Clock will start at next minute boundary.");
+    return;
+  }
+
+  if (strcmp(buffer, "stop_at_top") == 0) {
+    stop_at_top_pending = true;
+    start_at_minute_pending = false;
+    logMessage("Clock will stop at top of next revolution.");
+    return;
+  }
+
   TickMode requested;
   if (stringToMode(buffer, requested)) {
     pending_mode = requested;
     mode_change_pending = true;
-    Serial.printf("Mode change queued: %s (applies at next minute)\n", buffer);
+    logMessagef("Mode change queued: %s (applies at next revolution)", buffer);
   } else {
-    Serial.printf("Unknown mode: %s\n", buffer);
+    logMessagef("Unknown command: %s", buffer);
   }
 }
 
@@ -248,13 +273,13 @@ static void connectMqtt() {
   }
   last_mqtt_reconnect_attempt_ms = now;
 
-  Serial.printf("Connecting to MQTT %s:%d...\n", mqtt_host, mqtt_port);
+  logMessagef("Connecting to MQTT %s:%d...", mqtt_host, mqtt_port);
   if (mqtt_client.connect("sleight-of-hand")) {
-    Serial.println("MQTT connected.");
+    logMessage("MQTT connected.");
     mqtt_client.subscribe(MQTT_TOPIC_MODE_SET);
     publishCurrentMode();
   } else {
-    Serial.printf("MQTT connection failed, rc=%d\n", mqtt_client.state());
+    logMessagef("MQTT connection failed, rc=%d", mqtt_client.state());
   }
 }
 
@@ -266,6 +291,30 @@ static void onSaveConfig() {
   should_save_config = true;
 }
 
+// Called when the revolution completes (960 pulses done) to apply any pending
+// mode change before the idle gap.
+static void onRevolutionComplete() {
+  if (stop_at_top_pending) {
+    stop_at_top_pending = false;
+    stopped = true;
+    logMessage("Clock stopped at top.");
+    return;
+  }
+
+  if (mode_change_pending) {
+    current_mode = pending_mode;
+    mode_change_pending = false;
+    logMessagef("Mode changed to: %s", modeToString(current_mode));
+    publishCurrentMode();
+  }
+}
+
+// Called at each minute boundary to reset state for the new minute.
+static void startNewMinute() {
+  pulse_index = 0;
+  waiting_for_minute = false;
+}
+
 // --- Arduino entrypoints ---
 
 void setup() {
@@ -274,8 +323,8 @@ void setup() {
   pinMode(PIN_COIL_A, OUTPUT);
   pinMode(PIN_COIL_B, OUTPUT);
   setCoilIdle();
-  gpio_set_drive_capability((gpio_num_t)PIN_COIL_A, GPIO_DRIVE_CAP_3);
-  gpio_set_drive_capability((gpio_num_t)PIN_COIL_B, GPIO_DRIVE_CAP_3);
+  gpio_set_drive_capability((gpio_num_t)PIN_COIL_A, GPIO_DRIVE_CAP_2);
+  gpio_set_drive_capability((gpio_num_t)PIN_COIL_B, GPIO_DRIVE_CAP_2);
 
   delay(2000);
 
@@ -299,7 +348,7 @@ void setup() {
   wifi_manager.addParameter(&mqtt_host_param);
   wifi_manager.addParameter(&mqtt_port_param);
   wifi_manager.setConfigPortalTimeout(180);
-  wifi_manager.autoConnect("ClockSetup");
+  wifi_manager.autoConnect("SleightOfHand");
 
   if (should_save_config) {
     strncpy(mqtt_host, mqtt_host_param.getValue(), sizeof(mqtt_host) - 1);
@@ -313,23 +362,25 @@ void setup() {
     preferences.putString("mqtt_host", mqtt_host);
     preferences.putUShort("mqtt_port", mqtt_port);
     preferences.end();
-    Serial.printf("Saved MQTT config: %s:%d\n", mqtt_host, mqtt_port);
+    logMessagef("Saved MQTT config: %s:%d", mqtt_host, mqtt_port);
   }
 
   // NTP sync.
   configTime(UTC_OFFSET_SECONDS, 0, NTP_SERVER);
-  Serial.println("Waiting for NTP sync...");
+  logMessage("Waiting for NTP sync...");
 
   if (waitForNtpSync(10000)) {
     uint8_t current_second = getCurrentSecond();
-    Serial.printf("NTP synced, current second: %d\n", current_second);
+    logMessagef("NTP synced, current second: %d", current_second);
 
-    // The hand starts at 0 (12 o'clock) on boot. Advance it to the current
-    // second so minute and hour hands stay correct from the start.
-    catchUpToSecond(current_second);
-    Serial.printf("Caught up to second %d\n", current_second);
+    // The hand starts at 0 (12 o'clock) on boot. Advance it to match the
+    // current time so minute and hour hands stay correct from the start.
+    uint16_t target_pulse = (uint16_t)current_second * PULSES_PER_SECOND;
+    catchUpToPulse(target_pulse);
+    logMessagef("Caught up to pulse %d (second %d)", target_pulse,
+                current_second);
   } else {
-    Serial.println("NTP sync failed, starting from 0.");
+    logMessage("NTP sync failed, starting from 0.");
   }
 
   // MQTT setup.
@@ -337,45 +388,61 @@ void setup() {
   mqtt_client.setCallback(onMqttMessage);
 
   randomSeed(esp_random());
-  generateIntervals();
 
-  // Align the first tick to the next whole-second boundary so the schedule
-  // stays locked to real time.
-  struct tm timeinfo;
-  if (getLocalTime(&timeinfo)) {
-    struct timeval tv;
-    gettimeofday(&tv, nullptr);
-    uint32_t ms_into_second = tv.tv_usec / 1000;
-    next_tick_ms = millis() + (1000 - ms_into_second);
-  } else {
-    next_tick_ms = millis();
-  }
+  // Anchor the minute start to now minus how far we are into the current
+  // minute, so pulse scheduling aligns with NTP.
+  uint32_t ms_into_minute = getMsIntoMinute();
+  minute_start_ms = millis() - ms_into_minute;
 }
 
 void loop() {
-  if (!mqtt_client.connected()) {
+  // Only attempt MQTT (re)connection during the idle gap between revolutions,
+  // so the blocking connect() call doesn't stall pulse timing.
+  if (!mqtt_client.connected() && (waiting_for_minute || stopped)) {
     connectMqtt();
   }
   mqtt_client.loop();
 
   uint32_t now = millis();
-  if ((int32_t)(now - next_tick_ms) >= 0) {
-    tickOnce();
-    next_tick_ms += intervals[tick_index];
-    tick_index++;
 
-    if (tick_index >= TICKS_PER_MINUTE) {
-      tick_index = 0;
+  if (start_at_minute_pending) {
+    // Poll NTP until the second rolls over to 0, then start.
+    if (getMsIntoMinute() < 1000) {
+      stopped = false;
+      start_at_minute_pending = false;
+      pulse_index = 0;
+      waiting_for_minute = false;
+      minute_start_ms = millis();
+      logMessage("Minute boundary reached, clock started.");
+    }
+    return;
+  }
 
-      // Apply pending mode change at minute boundary.
-      if (mode_change_pending) {
-        current_mode = pending_mode;
-        mode_change_pending = false;
-        Serial.printf("Mode changed to: %s\n", modeToString(current_mode));
-        publishCurrentMode();
-      }
+  if (stopped) {
+    return;
+  }
 
-      generateIntervals();
+  if (waiting_for_minute) {
+    // All 960 pulses are done for this minute. Wait for the next minute
+    // boundary before starting again.
+    if (now - minute_start_ms >= 60000) {
+      minute_start_ms += 60000;
+      startNewMinute();
+    }
+    return;
+  }
+
+  // Schedule each pulse relative to the minute start, so accumulated delay()
+  // error doesn't matter — only the NTP-anchored minute_start_ms matters.
+  uint32_t cycle_ms = getCycleMs();
+  uint32_t target_ms = minute_start_ms + (uint32_t)pulse_index * cycle_ms;
+
+  if ((int32_t)(now - target_ms) >= 0) {
+    pulseOnce();
+
+    if (pulse_index >= PULSES_PER_REVOLUTION) {
+      onRevolutionComplete();
+      waiting_for_minute = true;
     }
   }
 }
