@@ -12,8 +12,8 @@ hand.
 - 100Ω resistor in series with the coil
 
 ```
-GPIO 25 --[100Ω]--> Coil pin A
-GPIO 26 --[100Ω]--> Coil pin B
+GPIO 1 --[100Ω]--> Coil pin A
+GPIO 3 --[100Ω]--> Coil pin B
 ```
 
 ## Building
