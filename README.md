@@ -59,9 +59,8 @@ exact number of pulses per revolution for your movement.
 2. The ESP32 creates a WiFi access point called **SleightOfHand**.
 3. Connect to it and configure your WiFi credentials, MQTT broker host, and
    MQTT broker port through the captive portal.
-4. The clock syncs to NTP and rapidly advances the second hand to the current
-   second.
-5. Normal sweeping begins.
+4. The clock syncs to NTP and waits for the next minute boundary.
+5. Sweeping begins exactly on the minute.
 
 WiFi credentials and MQTT settings are saved to flash and persist across
 reboots. The captive portal only appears when no saved credentials are found
@@ -78,6 +77,7 @@ mode is active.
 |---|---|
 | `steady` | 960 pulses at 62 ms cycle (30 ms pulse + 32 ms pause). Smooth continuous sweep completing in ~59.5 s, with a brief idle before the next minute. |
 | `rush_wait` | 960 pulses at 58 ms cycle (30 ms pulse + 28 ms pause). Completes the revolution in ~55.7 s, then idles for ~4.3 s until the next minute boundary. |
+| `vetinari` | 60 bursts of 16 pulses, each burst at a random cycle time (32–124 ms). The hand visibly speeds up and slows down each second, but completes the revolution in ~59.9 s. The burst order is reshuffled every minute. |
 
 The default mode is `rush_wait`.
 
@@ -92,6 +92,7 @@ The clock subscribes to `clock/mode/set` and publishes the current mode to
 ```sh
 mosquitto_pub -h <broker> -t clock/mode/set -m "rush_wait"
 mosquitto_pub -h <broker> -t clock/mode/set -m "steady"
+mosquitto_pub -h <broker> -t clock/mode/set -m "vetinari"
 ```
 
 Mode changes take effect when the current revolution completes (after 960 pulses).
@@ -142,4 +143,4 @@ Constants at the top of `src/main.cpp`:
 | `PULSES_PER_REVOLUTION` | 960 | Micro-steps per full revolution of the second hand |
 | `STEADY_CYCLE_MS` | 62 | Total cycle time (pulse + pause) for steady mode |
 | `RUSH_CYCLE_MS` | 58 | Total cycle time (pulse + pause) for rush_wait mode |
-| `CATCHUP_CYCLE_MS` | 32 | Cycle time for rapid catch-up pulses on boot |
+

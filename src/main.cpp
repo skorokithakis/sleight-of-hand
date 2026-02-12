@@ -11,14 +11,36 @@ constexpr int PIN_COIL_A = 4;
 constexpr int PIN_COIL_B = 5;
 constexpr uint32_t PULSE_MS = 30;
 constexpr uint16_t PULSES_PER_REVOLUTION = 960;
-constexpr uint16_t PULSES_PER_SECOND = PULSES_PER_REVOLUTION / 60;
-
 // Total time for one pulse cycle (energize + pause) per mode.
 constexpr uint32_t STEADY_CYCLE_MS = 62;
 constexpr uint32_t RUSH_CYCLE_MS = 58;
 
-// Catch-up pulses run as fast as reliably possible.
-constexpr uint32_t CATCHUP_CYCLE_MS = 32;
+
+// Vetinari mode: 60 bursts of 16 pulses each, with varying cycle times.
+// The sum of these values is 3744, so 16 * 3744 = 59904 ms per revolution
+// (~96 ms idle gap before the next minute boundary).
+constexpr uint8_t VETINARI_BURSTS = 60;
+constexpr uint8_t VETINARI_PULSES_PER_BURST = 16;
+constexpr uint8_t VETINARI_TEMPLATE[VETINARI_BURSTS] = {
+    49, 45, 114, 47, 37, 38, 37, 39, 55, 56, 37, 118,
+    55, 54, 123, 114, 40, 38, 48, 55, 56, 47, 40, 57,
+    34, 44, 118, 49, 115, 35, 52, 53, 45, 106, 39, 39,
+    51, 102, 32, 42, 118, 41, 124, 116, 35, 115, 49, 42,
+    117, 36, 54, 38, 37, 56, 112, 34, 55, 38, 124, 48,
+};
+
+// Mutable copy that gets Fisher-Yates shuffled at the start of each minute.
+uint8_t vetinari_cycles[VETINARI_BURSTS];
+
+static void shuffleVetinariCycles() {
+  memcpy(vetinari_cycles, VETINARI_TEMPLATE, sizeof(vetinari_cycles));
+  for (int i = VETINARI_BURSTS - 1; i > 0; i--) {
+    int j = esp_random() % (i + 1);
+    uint8_t tmp = vetinari_cycles[i];
+    vetinari_cycles[i] = vetinari_cycles[j];
+    vetinari_cycles[j] = tmp;
+  }
+}
 
 constexpr char NTP_SERVER[] = "pool.ntp.org";
 constexpr long UTC_OFFSET_SECONDS = 0;
@@ -45,6 +67,7 @@ uint32_t last_mqtt_reconnect_attempt_ms = 0;
 enum class TickMode : uint8_t {
   steady,
   rush_wait,
+  vetinari,
 };
 
 TickMode current_mode = TickMode::rush_wait;
@@ -111,6 +134,8 @@ static const char* modeToString(TickMode mode) {
       return "steady";
     case TickMode::rush_wait:
       return "rush_wait";
+    case TickMode::vetinari:
+      return "vetinari";
   }
   return "unknown";
 }
@@ -124,6 +149,10 @@ static bool stringToMode(const char* str, TickMode& out) {
     out = TickMode::rush_wait;
     return true;
   }
+  if (strcmp(str, "vetinari") == 0) {
+    out = TickMode::vetinari;
+    return true;
+  }
   return false;
 }
 
@@ -134,7 +163,7 @@ static void setCoilIdle() {
   digitalWrite(PIN_COIL_B, LOW);
 }
 
-static void pulseOnce() {
+static void pulseOnce(uint32_t pulse_ms = PULSE_MS) {
   if (polarity) {
     digitalWrite(PIN_COIL_A, HIGH);
     digitalWrite(PIN_COIL_B, LOW);
@@ -143,7 +172,7 @@ static void pulseOnce() {
     digitalWrite(PIN_COIL_B, HIGH);
   }
 
-  delay(PULSE_MS);
+  delay(pulse_ms);
   setCoilIdle();
   polarity = !polarity;
   pulse_index++;
@@ -155,6 +184,8 @@ static uint32_t getCycleMs() {
       return STEADY_CYCLE_MS;
     case TickMode::rush_wait:
       return RUSH_CYCLE_MS;
+    case TickMode::vetinari:
+      return vetinari_cycles[pulse_index / VETINARI_PULSES_PER_BURST];
   }
   return STEADY_CYCLE_MS;
 }
@@ -174,12 +205,6 @@ static bool waitForNtpSync(uint32_t timeout_ms) {
   return false;
 }
 
-static uint8_t getCurrentSecond() {
-  struct tm timeinfo;
-  getLocalTime(&timeinfo);
-  return timeinfo.tm_sec;
-}
-
 // Returns how many milliseconds have elapsed since the top of the current
 // minute, according to NTP.
 static uint32_t getMsIntoMinute() {
@@ -188,18 +213,6 @@ static uint32_t getMsIntoMinute() {
   struct tm timeinfo;
   localtime_r(&tv.tv_sec, &timeinfo);
   return (uint32_t)timeinfo.tm_sec * 1000 + (uint32_t)(tv.tv_usec / 1000);
-}
-
-// Rapidly pulse the motor to advance the hand to the target pulse position.
-// Used at boot after NTP sync so the hand catches up to real time.
-static void catchUpToPulse(uint16_t target_pulse) {
-  while (pulse_index < target_pulse) {
-    pulseOnce();
-    uint32_t pause_ms = CATCHUP_CYCLE_MS > PULSE_MS ? CATCHUP_CYCLE_MS - PULSE_MS : 0;
-    if (pause_ms > 0) {
-      delay(pause_ms);
-    }
-  }
 }
 
 // --- MQTT ---
@@ -313,6 +326,9 @@ static void onRevolutionComplete() {
 static void startNewMinute() {
   pulse_index = 0;
   waiting_for_minute = false;
+  if (current_mode == TickMode::vetinari) {
+    shuffleVetinariCycles();
+  }
 }
 
 // --- Arduino entrypoints ---
@@ -370,17 +386,9 @@ void setup() {
   logMessage("Waiting for NTP sync...");
 
   if (waitForNtpSync(10000)) {
-    uint8_t current_second = getCurrentSecond();
-    logMessagef("NTP synced, current second: %d", current_second);
-
-    // The hand starts at 0 (12 o'clock) on boot. Advance it to match the
-    // current time so minute and hour hands stay correct from the start.
-    uint16_t target_pulse = (uint16_t)current_second * PULSES_PER_SECOND;
-    catchUpToPulse(target_pulse);
-    logMessagef("Caught up to pulse %d (second %d)", target_pulse,
-                current_second);
+    logMessage("NTP synced, waiting for minute boundary to start.");
   } else {
-    logMessage("NTP sync failed, starting from 0.");
+    logMessage("NTP sync failed, waiting for minute boundary to start.");
   }
 
   // MQTT setup.
@@ -389,10 +397,10 @@ void setup() {
 
   randomSeed(esp_random());
 
-  // Anchor the minute start to now minus how far we are into the current
-  // minute, so pulse scheduling aligns with NTP.
-  uint32_t ms_into_minute = getMsIntoMinute();
-  minute_start_ms = millis() - ms_into_minute;
+  // Wait for the next minute boundary before starting, so the hand (assumed
+  // to be at 12 o'clock) begins exactly on the minute.
+  stopped = true;
+  start_at_minute_pending = true;
 }
 
 void loop() {
@@ -428,6 +436,22 @@ void loop() {
     if (now - minute_start_ms >= 60000) {
       minute_start_ms += 60000;
       startNewMinute();
+    }
+    return;
+  }
+
+  if (current_mode == TickMode::vetinari) {
+    // Vetinari mode drives pulses inline with delay() rather than scheduling
+    // against an absolute timeline. The pre-shuffled cycle array guarantees
+    // the total revolution time, so we don't need NTP-anchored scheduling.
+    uint32_t cycle_ms = getCycleMs();
+    uint32_t half_cycle = cycle_ms / 2;
+    pulseOnce(half_cycle);
+    delay(half_cycle);
+
+    if (pulse_index >= PULSES_PER_REVOLUTION) {
+      onRevolutionComplete();
+      waiting_for_minute = true;
     }
     return;
   }
