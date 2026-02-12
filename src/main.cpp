@@ -76,8 +76,8 @@ enum class TickMode : uint8_t {
   crawl,
 };
 
-TickMode current_mode = TickMode::rush_wait;
-TickMode pending_mode = TickMode::rush_wait;
+TickMode current_mode = TickMode::vetinari;
+TickMode pending_mode = TickMode::vetinari;
 bool mode_change_pending = false;
 
 // --- State ---

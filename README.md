@@ -85,7 +85,7 @@ Sprint and crawl are positioning modes, not timekeeping modes. When switching
 from either back to a timed mode, the clock waits for the next NTP minute
 boundary to re-sync.
 
-The default mode is `rush_wait`.
+The default mode is `vetinari`.
 
 
 ## MQTT
