@@ -277,9 +277,20 @@ static void onMqttMessage(char* topic, byte* payload, unsigned int length) {
 
   TickMode requested;
   if (stringToMode(buffer, requested)) {
-    pending_mode = requested;
-    mode_change_pending = true;
-    logMessagef("Mode change queued: %s (applies at next revolution)", buffer);
+    if (requested == TickMode::sprint) {
+      // Sprint activates immediately so the user sees the speed change
+      // without waiting for the current revolution to finish.
+      current_mode = TickMode::sprint;
+      mode_change_pending = false;
+      waiting_for_minute = false;
+      logMessage("Mode changed to: sprint (immediate)");
+      publishCurrentMode();
+    } else {
+      pending_mode = requested;
+      mode_change_pending = true;
+      logMessagef("Mode change queued: %s (applies at next revolution)",
+                   buffer);
+    }
   } else {
     logMessagef("Unknown command: %s", buffer);
   }
