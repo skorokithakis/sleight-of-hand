@@ -77,7 +77,7 @@ of which mode is active.
 |---|---|
 | `steady` | 960 pulses at 62 ms cycle (30 ms pulse + 32 ms pause). Smooth continuous sweep completing in ~59.5 s, with a brief idle before the next minute. |
 | `rush_wait` | 960 pulses at 58 ms cycle (30 ms pulse + 28 ms pause). Completes the revolution in ~55.7 s, then idles for ~4.3 s until the next minute boundary. |
-| `vetinari` | 60 bursts of 16 pulses, each burst at a random cycle time (32–123 ms). The hand visibly speeds up and slows down each second, but completes the revolution in ~59.0 s. The burst order is reshuffled every minute. |
+| `vetinari` | 60 bursts of 16 pulses, each burst at a random cycle time (32–117 ms). The hand visibly speeds up and slows down each second, but completes the revolution in ~58.0 s. The burst order is reshuffled every minute. |
 | `sprint` | Fast continuous sweep at 32 ms cycle (16 ms pulse + 16 ms pause), completing a revolution in ~30.7 s. Useful for quickly advancing the hand to a target position. Activates immediately. Runs continuously without NTP anchoring. |
 | `crawl` | Slow continuous sweep at 230 ms cycle (30 ms pulse + 200 ms pause), completing a revolution in ~3 min 41 s. Useful for precisely positioning the hand at 12 o'clock before starting a timed mode. Activates immediately. Runs continuously without NTP anchoring. |
 

@@ -19,18 +19,18 @@ constexpr uint32_t CRAWL_CYCLE_MS = 230;
 
 
 // Vetinari mode: 60 bursts of 16 pulses each, with varying cycle times.
-// The sum of these values is 3687, so 16 * 3687 = 58992 ms per revolution
-// (~1 s idle gap before the next minute boundary). The extra headroom
+// The sum of these values is 3625, so 16 * 3625 = 58000 ms per revolution
+// (~2 s idle gap before the next minute boundary). The extra headroom
 // absorbs per-iteration loop overhead (GPIO, MQTT, millis) that would
 // otherwise push the revolution past 60 seconds.
 constexpr uint8_t VETINARI_BURSTS = 60;
 constexpr uint8_t VETINARI_PULSES_PER_BURST = 16;
 constexpr uint8_t VETINARI_TEMPLATE[VETINARI_BURSTS] = {
-     49,  45, 110,  47,  37,  38,  37,  39,  55,  56,  37, 114,
-     55,  54, 119, 110,  40,  38,  48,  55,  56,  47,  40,  57,
-     34,  44, 114,  49, 111,  35,  52,  53,  45, 102,  39,  39,
-     51,  98,  32,  42, 114,  41, 120, 112,  35, 111,  49,  42,
-    113,  36,  54,  38,  37,  56, 108,  34,  55,  38, 123,  48,
+     49,  45, 106,  47,  37,  38,  37,  39,  55,  56,  37, 110,
+     55,  54, 115, 106,  40,  38,  48,  55,  56,  47,  40,  57,
+     34,  44, 110,  49, 107,  35,  52,  53,  45,  98,  39,  39,
+     51,  94,  32,  42, 110,  41, 116, 108,  35, 107,  49,  42,
+    109,  36,  54,  38,  37,  56, 104,  34,  55,  38, 117,  48,
 };
 
 // Mutable copy that gets Fisher-Yates shuffled at the start of each minute.
