@@ -15,6 +15,7 @@ constexpr uint16_t PULSES_PER_REVOLUTION = 960;
 constexpr uint32_t STEADY_CYCLE_MS = 62;
 constexpr uint32_t RUSH_CYCLE_MS = 58;
 constexpr uint32_t SPRINT_CYCLE_MS = 32;
+constexpr uint32_t CRAWL_CYCLE_MS = 230;
 
 
 // Vetinari mode: 60 bursts of 16 pulses each, with varying cycle times.
@@ -70,6 +71,7 @@ enum class TickMode : uint8_t {
   rush_wait,
   vetinari,
   sprint,
+  crawl,
 };
 
 TickMode current_mode = TickMode::rush_wait;
@@ -140,6 +142,8 @@ static const char* modeToString(TickMode mode) {
       return "vetinari";
     case TickMode::sprint:
       return "sprint";
+    case TickMode::crawl:
+      return "crawl";
   }
   return "unknown";
 }
@@ -159,6 +163,10 @@ static bool stringToMode(const char* str, TickMode& out) {
   }
   if (strcmp(str, "sprint") == 0) {
     out = TickMode::sprint;
+    return true;
+  }
+  if (strcmp(str, "crawl") == 0) {
+    out = TickMode::crawl;
     return true;
   }
   return false;
@@ -196,6 +204,8 @@ static uint32_t getCycleMs() {
       return vetinari_cycles[pulse_index / VETINARI_PULSES_PER_BURST];
     case TickMode::sprint:
       return SPRINT_CYCLE_MS;
+    case TickMode::crawl:
+      return CRAWL_CYCLE_MS;
   }
   return STEADY_CYCLE_MS;
 }
@@ -277,13 +287,13 @@ static void onMqttMessage(char* topic, byte* payload, unsigned int length) {
 
   TickMode requested;
   if (stringToMode(buffer, requested)) {
-    if (requested == TickMode::sprint) {
-      // Sprint activates immediately so the user sees the speed change
-      // without waiting for the current revolution to finish.
-      current_mode = TickMode::sprint;
+    if (requested == TickMode::sprint || requested == TickMode::crawl) {
+      // Sprint and crawl activate immediately because they're manual
+      // positioning modes, not timekeeping modes.
+      current_mode = requested;
       mode_change_pending = false;
       waiting_for_minute = false;
-      logMessage("Mode changed to: sprint (immediate)");
+      logMessagef("Mode changed to: %s (immediate)", modeToString(requested));
       publishCurrentMode();
     } else {
       pending_mode = requested;
@@ -342,9 +352,13 @@ static void onRevolutionComplete() {
     logMessagef("Mode changed to: %s", modeToString(current_mode));
     publishCurrentMode();
 
-    // Sprint doesn't track NTP, so when switching away from it to a
-    // time-keeping mode, wait for the next minute boundary to re-sync.
-    if (old_mode == TickMode::sprint && current_mode != TickMode::sprint) {
+    // Sprint and crawl don't track NTP, so when switching away from them
+    // to a timekeeping mode, wait for the next minute boundary to re-sync.
+    bool was_unanchored =
+        old_mode == TickMode::sprint || old_mode == TickMode::crawl;
+    bool is_unanchored =
+        current_mode == TickMode::sprint || current_mode == TickMode::crawl;
+    if (was_unanchored && !is_unanchored) {
       stopped = true;
       start_at_minute_pending = true;
       logMessage("Waiting for minute boundary to re-sync.");
@@ -470,12 +484,12 @@ void loop() {
     return;
   }
 
-  if (current_mode == TickMode::sprint) {
-    // Sprint mode runs continuously with no NTP anchoring. After each
+  if (current_mode == TickMode::sprint || current_mode == TickMode::crawl) {
+    // Sprint and crawl run continuously with no NTP anchoring. After each
     // revolution, reset and immediately start the next one.
-    uint32_t half_cycle = SPRINT_CYCLE_MS / 2;
-    pulseOnce(half_cycle);
-    delay(half_cycle);
+    uint32_t cycle_ms = getCycleMs();
+    pulseOnce(PULSE_MS);
+    delay(cycle_ms - PULSE_MS);
 
     if (pulse_index >= PULSES_PER_REVOLUTION) {
       onRevolutionComplete();

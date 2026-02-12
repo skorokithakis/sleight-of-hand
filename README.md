@@ -69,16 +69,21 @@ reboots. The captive portal only appears when no saved credentials are found
 
 ## Sweep modes
 
-All modes except `sprint` produce exactly 960 pulses (one full revolution) per
-minute, anchored to NTP minute boundaries, so the clock keeps accurate time
-regardless of which mode is active.
+All timed modes produce exactly 960 pulses (one full revolution) per minute,
+anchored to NTP minute boundaries, so the clock keeps accurate time regardless
+of which mode is active.
 
 | Mode | Description |
 |---|---|
 | `steady` | 960 pulses at 62 ms cycle (30 ms pulse + 32 ms pause). Smooth continuous sweep completing in ~59.5 s, with a brief idle before the next minute. |
 | `rush_wait` | 960 pulses at 58 ms cycle (30 ms pulse + 28 ms pause). Completes the revolution in ~55.7 s, then idles for ~4.3 s until the next minute boundary. |
 | `vetinari` | 60 bursts of 16 pulses, each burst at a random cycle time (32–124 ms). The hand visibly speeds up and slows down each second, but completes the revolution in ~59.9 s. The burst order is reshuffled every minute. |
-| `sprint` | 960 pulses at 32 ms cycle (16 ms pulse + 16 ms pause), completing a revolution in ~30.7 s with no idle gap. Runs continuously without NTP anchoring. When switching back to a timed mode, the clock waits for the next minute boundary to re-sync. |
+| `sprint` | Fast continuous sweep at 32 ms cycle (16 ms pulse + 16 ms pause), completing a revolution in ~30.7 s. Useful for quickly advancing the hand to a target position. Activates immediately. Runs continuously without NTP anchoring. |
+| `crawl` | Slow continuous sweep at 230 ms cycle (30 ms pulse + 200 ms pause), completing a revolution in ~3 min 41 s. Useful for precisely positioning the hand at 12 o'clock before starting a timed mode. Activates immediately. Runs continuously without NTP anchoring. |
+
+Sprint and crawl are positioning modes, not timekeeping modes. When switching
+from either back to a timed mode, the clock waits for the next NTP minute
+boundary to re-sync.
 
 The default mode is `rush_wait`.
 
@@ -95,9 +100,11 @@ mosquitto_pub -h <broker> -t clock/mode/set -m "rush_wait"
 mosquitto_pub -h <broker> -t clock/mode/set -m "steady"
 mosquitto_pub -h <broker> -t clock/mode/set -m "vetinari"
 mosquitto_pub -h <broker> -t clock/mode/set -m "sprint"
+mosquitto_pub -h <broker> -t clock/mode/set -m "crawl"
 ```
 
-Mode changes take effect when the current revolution completes (after 960 pulses).
+Mode changes take effect when the current revolution completes (after 960
+pulses), except sprint and crawl which activate immediately.
 
 ### Control commands
 
@@ -146,4 +153,5 @@ Constants at the top of `src/main.cpp`:
 | `STEADY_CYCLE_MS` | 62 | Total cycle time (pulse + pause) for steady mode |
 | `RUSH_CYCLE_MS` | 58 | Total cycle time (pulse + pause) for rush_wait mode |
 | `SPRINT_CYCLE_MS` | 32 | Total cycle time (pulse + pause) for sprint mode |
+| `CRAWL_CYCLE_MS` | 230 | Total cycle time (pulse + pause) for crawl mode |
 
