@@ -19,16 +19,18 @@ constexpr uint32_t CRAWL_CYCLE_MS = 230;
 
 
 // Vetinari mode: 60 bursts of 16 pulses each, with varying cycle times.
-// The sum of these values is 3744, so 16 * 3744 = 59904 ms per revolution
-// (~96 ms idle gap before the next minute boundary).
+// The sum of these values is 3687, so 16 * 3687 = 58992 ms per revolution
+// (~1 s idle gap before the next minute boundary). The extra headroom
+// absorbs per-iteration loop overhead (GPIO, MQTT, millis) that would
+// otherwise push the revolution past 60 seconds.
 constexpr uint8_t VETINARI_BURSTS = 60;
 constexpr uint8_t VETINARI_PULSES_PER_BURST = 16;
 constexpr uint8_t VETINARI_TEMPLATE[VETINARI_BURSTS] = {
-    49, 45, 114, 47, 37, 38, 37, 39, 55, 56, 37, 118,
-    55, 54, 123, 114, 40, 38, 48, 55, 56, 47, 40, 57,
-    34, 44, 118, 49, 115, 35, 52, 53, 45, 106, 39, 39,
-    51, 102, 32, 42, 118, 41, 124, 116, 35, 115, 49, 42,
-    117, 36, 54, 38, 37, 56, 112, 34, 55, 38, 124, 48,
+     49,  45, 110,  47,  37,  38,  37,  39,  55,  56,  37, 114,
+     55,  54, 119, 110,  40,  38,  48,  55,  56,  47,  40,  57,
+     34,  44, 114,  49, 111,  35,  52,  53,  45, 102,  39,  39,
+     51,  98,  32,  42, 114,  41, 120, 112,  35, 111,  49,  42,
+    113,  36,  54,  38,  37,  56, 108,  34,  55,  38, 123,  48,
 };
 
 // Mutable copy that gets Fisher-Yates shuffled at the start of each minute.
@@ -172,6 +174,10 @@ static bool stringToMode(const char* str, TickMode& out) {
   return false;
 }
 
+static bool isTimekeeping(TickMode mode) {
+  return mode != TickMode::sprint && mode != TickMode::crawl;
+}
+
 // --- Coil drive ---
 
 static void setCoilIdle() {
@@ -287,13 +293,22 @@ static void onMqttMessage(char* topic, byte* payload, unsigned int length) {
 
   TickMode requested;
   if (stringToMode(buffer, requested)) {
-    if (requested == TickMode::sprint || requested == TickMode::crawl) {
-      // Sprint and crawl activate immediately because they're manual
-      // positioning modes, not timekeeping modes.
+    if (!isTimekeeping(requested)) {
+      // Positioning modes activate immediately because they don't need NTP
+      // synchronization.
       current_mode = requested;
       mode_change_pending = false;
       waiting_for_minute = false;
       logMessagef("Mode changed to: %s (immediate)", modeToString(requested));
+      publishCurrentMode();
+    } else if (stopped) {
+      // No revolution to wait for, so apply the mode immediately and wait for
+      // the next minute boundary to start synchronized.
+      current_mode = requested;
+      mode_change_pending = false;
+      start_at_minute_pending = true;
+      logMessagef("Mode changed to: %s (starting at next minute boundary)",
+                   modeToString(requested));
       publishCurrentMode();
     } else {
       pending_mode = requested;
@@ -352,13 +367,9 @@ static void onRevolutionComplete() {
     logMessagef("Mode changed to: %s", modeToString(current_mode));
     publishCurrentMode();
 
-    // Sprint and crawl don't track NTP, so when switching away from them
-    // to a timekeeping mode, wait for the next minute boundary to re-sync.
-    bool was_unanchored =
-        old_mode == TickMode::sprint || old_mode == TickMode::crawl;
-    bool is_unanchored =
-        current_mode == TickMode::sprint || current_mode == TickMode::crawl;
-    if (was_unanchored && !is_unanchored) {
+    // When switching from a positioning mode to a timekeeping mode, wait for
+    // the next minute boundary to re-sync.
+    if (!isTimekeeping(old_mode) && isTimekeeping(current_mode)) {
       stopped = true;
       start_at_minute_pending = true;
       logMessage("Waiting for minute boundary to re-sync.");
@@ -460,11 +471,16 @@ void loop() {
   if (start_at_minute_pending) {
     // Poll NTP until the second rolls over to 0, then start.
     if (getMsIntoMinute() < 1000) {
+      if (mode_change_pending) {
+        current_mode = pending_mode;
+        mode_change_pending = false;
+        logMessagef("Mode changed to: %s", modeToString(current_mode));
+        publishCurrentMode();
+      }
       stopped = false;
       start_at_minute_pending = false;
-      pulse_index = 0;
-      waiting_for_minute = false;
       minute_start_ms = millis();
+      startNewMinute();
       logMessage("Minute boundary reached, clock started.");
     }
     return;
@@ -484,51 +500,20 @@ void loop() {
     return;
   }
 
-  if (current_mode == TickMode::sprint || current_mode == TickMode::crawl) {
-    // Sprint and crawl run continuously with no NTP anchoring. After each
-    // revolution, reset and immediately start the next one.
-    uint32_t cycle_ms = getCycleMs();
-    // Sprint uses a shorter pulse to fit within its 32ms cycle. Crawl uses
-    // the standard pulse duration since its 230ms cycle has plenty of room.
-    uint32_t pulse_ms =
-        current_mode == TickMode::sprint ? cycle_ms / 2 : PULSE_MS;
-    pulseOnce(pulse_ms);
-    delay(cycle_ms - pulse_ms);
-
-    if (pulse_index >= PULSES_PER_REVOLUTION) {
-      onRevolutionComplete();
-      pulse_index = 0;
-    }
-    return;
-  }
-
-  if (current_mode == TickMode::vetinari) {
-    // Vetinari mode drives pulses inline with delay() rather than scheduling
-    // against an absolute timeline. The pre-shuffled cycle array guarantees
-    // the total revolution time, so we don't need NTP-anchored scheduling.
-    uint32_t cycle_ms = getCycleMs();
-    uint32_t half_cycle = cycle_ms / 2;
-    pulseOnce(half_cycle);
-    delay(half_cycle);
-
-    if (pulse_index >= PULSES_PER_REVOLUTION) {
-      onRevolutionComplete();
-      waiting_for_minute = true;
-    }
-    return;
-  }
-
-  // Schedule each pulse relative to the minute start, so accumulated delay()
-  // error doesn't matter — only the NTP-anchored minute_start_ms matters.
   uint32_t cycle_ms = getCycleMs();
-  uint32_t target_ms = minute_start_ms + (uint32_t)pulse_index * cycle_ms;
+  // Crawl needs a short pulse with a long pause to move the hand slowly.
+  // All other modes split the cycle evenly between pulse and pause.
+  uint32_t pulse_ms =
+      current_mode == TickMode::crawl ? PULSE_MS : cycle_ms / 2;
+  pulseOnce(pulse_ms);
+  delay(cycle_ms - pulse_ms);
 
-  if ((int32_t)(now - target_ms) >= 0) {
-    pulseOnce();
-
-    if (pulse_index >= PULSES_PER_REVOLUTION) {
-      onRevolutionComplete();
+  if (pulse_index >= PULSES_PER_REVOLUTION) {
+    onRevolutionComplete();
+    if (isTimekeeping(current_mode)) {
       waiting_for_minute = true;
+    } else {
+      pulse_index = 0;
     }
   }
 }
