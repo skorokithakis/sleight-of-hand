@@ -14,6 +14,7 @@ constexpr uint16_t PULSES_PER_REVOLUTION = 960;
 // Total time for one pulse cycle (energize + pause) per mode.
 constexpr uint32_t STEADY_CYCLE_MS = 62;
 constexpr uint32_t RUSH_CYCLE_MS = 58;
+constexpr uint32_t SPRINT_CYCLE_MS = 32;
 
 
 // Vetinari mode: 60 bursts of 16 pulses each, with varying cycle times.
@@ -68,6 +69,7 @@ enum class TickMode : uint8_t {
   steady,
   rush_wait,
   vetinari,
+  sprint,
 };
 
 TickMode current_mode = TickMode::rush_wait;
@@ -136,6 +138,8 @@ static const char* modeToString(TickMode mode) {
       return "rush_wait";
     case TickMode::vetinari:
       return "vetinari";
+    case TickMode::sprint:
+      return "sprint";
   }
   return "unknown";
 }
@@ -151,6 +155,10 @@ static bool stringToMode(const char* str, TickMode& out) {
   }
   if (strcmp(str, "vetinari") == 0) {
     out = TickMode::vetinari;
+    return true;
+  }
+  if (strcmp(str, "sprint") == 0) {
+    out = TickMode::sprint;
     return true;
   }
   return false;
@@ -186,6 +194,8 @@ static uint32_t getCycleMs() {
       return RUSH_CYCLE_MS;
     case TickMode::vetinari:
       return vetinari_cycles[pulse_index / VETINARI_PULSES_PER_BURST];
+    case TickMode::sprint:
+      return SPRINT_CYCLE_MS;
   }
   return STEADY_CYCLE_MS;
 }
@@ -315,10 +325,19 @@ static void onRevolutionComplete() {
   }
 
   if (mode_change_pending) {
+    TickMode old_mode = current_mode;
     current_mode = pending_mode;
     mode_change_pending = false;
     logMessagef("Mode changed to: %s", modeToString(current_mode));
     publishCurrentMode();
+
+    // Sprint doesn't track NTP, so when switching away from it to a
+    // time-keeping mode, wait for the next minute boundary to re-sync.
+    if (old_mode == TickMode::sprint && current_mode != TickMode::sprint) {
+      stopped = true;
+      start_at_minute_pending = true;
+      logMessage("Waiting for minute boundary to re-sync.");
+    }
   }
 }
 
@@ -436,6 +455,20 @@ void loop() {
     if (now - minute_start_ms >= 60000) {
       minute_start_ms += 60000;
       startNewMinute();
+    }
+    return;
+  }
+
+  if (current_mode == TickMode::sprint) {
+    // Sprint mode runs continuously with no NTP anchoring. After each
+    // revolution, reset and immediately start the next one.
+    uint32_t half_cycle = SPRINT_CYCLE_MS / 2;
+    pulseOnce(half_cycle);
+    delay(half_cycle);
+
+    if (pulse_index >= PULSES_PER_REVOLUTION) {
+      onRevolutionComplete();
+      pulse_index = 0;
     }
     return;
   }
