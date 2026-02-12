@@ -488,8 +488,12 @@ void loop() {
     // Sprint and crawl run continuously with no NTP anchoring. After each
     // revolution, reset and immediately start the next one.
     uint32_t cycle_ms = getCycleMs();
-    pulseOnce(PULSE_MS);
-    delay(cycle_ms - PULSE_MS);
+    // Sprint uses a shorter pulse to fit within its 32ms cycle. Crawl uses
+    // the standard pulse duration since its 230ms cycle has plenty of room.
+    uint32_t pulse_ms =
+        current_mode == TickMode::sprint ? cycle_ms / 2 : PULSE_MS;
+    pulseOnce(pulse_ms);
+    delay(cycle_ms - pulse_ms);
 
     if (pulse_index >= PULSES_PER_REVOLUTION) {
       onRevolutionComplete();
