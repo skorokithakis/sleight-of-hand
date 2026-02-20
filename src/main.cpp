@@ -9,9 +9,20 @@
 
 constexpr int PIN_COIL_A = 4;
 constexpr int PIN_COIL_B = 5;
-constexpr uint32_t PULSE_MS = 30;
 constexpr uint16_t PULSES_PER_REVOLUTION = 960;
+
+// Set to true for a ticking movement (one pulse per second), false for a
+// sweeping movement (continuous motion).
+#define TICKING_MOVEMENT true
+
+#if TICKING_MOVEMENT
+constexpr uint32_t PULSE_MS = 31;
+#else
+constexpr uint32_t PULSE_MS = 30;
+#endif
 // Total time for one pulse cycle (energize + pause) per mode.
+// For sweeping movements, the pulse duration is half the cycle time.
+// For ticking movements, these values are ignored for timekeeping modes.
 constexpr uint32_t STEADY_CYCLE_MS = 62;
 constexpr uint32_t RUSH_CYCLE_MS = 58;
 constexpr uint32_t SPRINT_CYCLE_MS = 32;
@@ -500,6 +511,30 @@ void loop() {
     return;
   }
 
+#if TICKING_MOVEMENT
+  // For ticking movements, timekeeping modes fire a burst of 16 pulses once
+  // per second (the hand jumps one second mark per tick).
+  if (isTimekeeping(current_mode)) {
+    uint32_t elapsed = now - minute_start_ms;
+    uint32_t current_second = elapsed / 1000;
+    uint32_t expected_pulses = (current_second + 1) * 16;
+    if (expected_pulses > PULSES_PER_REVOLUTION) {
+      expected_pulses = PULSES_PER_REVOLUTION;
+    }
+
+    if (pulse_index < expected_pulses) {
+      // Fire all 16 pulses in a rapid burst.
+      while (pulse_index < expected_pulses) {
+        pulseOnce(PULSE_MS);
+      }
+    }
+  } else {
+    // Positioning modes use the same cycle-based timing as sweeping movements.
+    uint32_t cycle_ms = getCycleMs();
+    pulseOnce(PULSE_MS);
+    delay(cycle_ms - PULSE_MS);
+  }
+#else
   uint32_t cycle_ms = getCycleMs();
   // Crawl needs a short pulse with a long pause to move the hand slowly.
   // All other modes split the cycle evenly between pulse and pause.
@@ -507,6 +542,7 @@ void loop() {
       current_mode == TickMode::crawl ? PULSE_MS : cycle_ms / 2;
   pulseOnce(pulse_ms);
   delay(cycle_ms - pulse_ms);
+#endif
 
   if (pulse_index >= PULSES_PER_REVOLUTION) {
     onRevolutionComplete();
