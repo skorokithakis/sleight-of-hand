@@ -13,8 +13,8 @@ constexpr uint16_t PULSES_PER_REVOLUTION = 60;
 
 constexpr uint32_t PULSE_MS = 31;
 
-constexpr uint32_t SPRINT_GAP_MS = 269;
-constexpr uint32_t CRAWL_GAP_MS = 1969;      // 2s total tick
+constexpr uint32_t SPRINT_DEFAULT_MS = 300;
+constexpr uint32_t CRAWL_DEFAULT_MS = 2000;
 
 constexpr uint8_t TICK_COUNT = 59;
 
@@ -74,6 +74,9 @@ bool mode_change_pending = false;
 // can fall back to it if current_mode is a positioning mode when the minute
 // boundary fires. Vetinari is the default because it's the power-on mode.
 TickMode last_timekeeping_mode = TickMode::vetinari;
+
+// Set on every sprint/crawl activation; no default needed.
+uint32_t positioning_tick_ms = 0;
 
 // --- State ---
 
@@ -293,6 +296,35 @@ static void onMqttMessage(char* topic, byte* payload, unsigned int length) {
     return;
   }
 
+  // Check for positioning modes with an optional tick-duration parameter
+  // (e.g. "sprint 150" or "crawl 500"). This must happen before stringToMode()
+  // so the bare name still works for all other callers of stringToMode().
+  TickMode parameterized_mode;
+  bool has_parameterized_mode = false;
+  if (strncmp(buffer, "sprint ", 7) == 0) {
+    parameterized_mode = TickMode::sprint;
+    has_parameterized_mode = true;
+    uint32_t requested_ms = (uint32_t)strtoul(buffer + 7, nullptr, 10);
+    positioning_tick_ms = requested_ms < 50 ? 50 : requested_ms;
+  } else if (strncmp(buffer, "crawl ", 6) == 0) {
+    parameterized_mode = TickMode::crawl;
+    has_parameterized_mode = true;
+    uint32_t requested_ms = (uint32_t)strtoul(buffer + 6, nullptr, 10);
+    positioning_tick_ms = requested_ms < 50 ? 50 : requested_ms;
+  }
+
+  if (has_parameterized_mode) {
+    current_mode = parameterized_mode;
+    mode_change_pending = false;
+    stopped = false;
+    start_at_minute_pending = false;
+    stop_at_top_pending = false;
+    logMessagef("Mode changed to: %s (immediate, tick=%ums)",
+                modeToString(parameterized_mode), positioning_tick_ms);
+    publishCurrentMode();
+    return;
+  }
+
   TickMode requested;
   if (stringToMode(buffer, requested)) {
     if (!isTimekeeping(requested)) {
@@ -300,12 +332,16 @@ static void onMqttMessage(char* topic, byte* payload, unsigned int length) {
       // synchronization. Any pending blocking state is superseded: the user
       // explicitly chose a positioning mode, so waiting for a minute boundary
       // or a stop-at-top would prevent it from ever starting.
+      positioning_tick_ms = (requested == TickMode::sprint)
+                                ? SPRINT_DEFAULT_MS
+                                : CRAWL_DEFAULT_MS;
       current_mode = requested;
       mode_change_pending = false;
       stopped = false;
       start_at_minute_pending = false;
       stop_at_top_pending = false;
-      logMessagef("Mode changed to: %s (immediate)", modeToString(requested));
+      logMessagef("Mode changed to: %s (immediate, tick=%ums)",
+                  modeToString(requested), positioning_tick_ms);
       publishCurrentMode();
     } else if (stopped) {
       // No revolution to wait for, so apply the mode immediately and wait for
@@ -528,13 +564,10 @@ void loop() {
     }
   } else {
     // Positioning modes (sprint/crawl) run continuously without NTP sync.
-    if (current_mode == TickMode::sprint) {
-      pulseOnce();
-      delay(SPRINT_GAP_MS);
-    } else {
-      pulseOnce();
-      delay(CRAWL_GAP_MS);
-    }
+    // Both modes share the same structure; only the tick duration differs,
+    // and that is already stored in positioning_tick_ms.
+    pulseOnce();
+    delay(positioning_tick_ms - PULSE_MS);
     if (pulse_index >= PULSES_PER_REVOLUTION) {
       onRevolutionComplete();
       pulse_index = 0;

@@ -79,8 +79,8 @@ Each timekeeping mode defines the 59-element `tick_durations` array.
 | `steady` | 59 ticks at 1000 ms each. The hand advances once per second, with ~1 s idle at the minute boundary. |
 | `rush_wait` | 59 ticks at 932 ms each. Completes in ~55 s, then idles ~5 s until the next minute boundary. |
 | `vetinari` | 59 ticks with shuffled irregular durations (534–2001 ms). The hand visibly speeds up and slows down, but completes the minute on time. Reshuffled every minute. |
-| `sprint` | Continuous ticking at 300 ms per tick. For quickly advancing the hand to a target position. Activates immediately; not NTP-anchored. |
-| `crawl` | Continuous ticking at 2000 ms per tick. For precisely positioning the hand at 12 o'clock. Activates immediately; not NTP-anchored. |
+| `sprint` | Continuous ticking at a configurable duration (default 300 ms per tick). For quickly advancing the hand to a target position. Activates immediately; not NTP-anchored. |
+| `crawl` | Continuous ticking at a configurable duration (default 2000 ms per tick). For precisely positioning the hand at 12 o'clock. Activates immediately; not NTP-anchored. |
 
 Sprint and crawl are positioning modes, not timekeeping modes. When switching
 from either back to a timed mode, the clock waits for the next NTP minute
@@ -102,6 +102,11 @@ mosquitto_pub -h <broker> -t clock/mode/set -m "steady"
 mosquitto_pub -h <broker> -t clock/mode/set -m "vetinari"
 mosquitto_pub -h <broker> -t clock/mode/set -m "sprint"
 mosquitto_pub -h <broker> -t clock/mode/set -m "crawl"
+
+# Sprint and crawl accept an optional tick duration in milliseconds (minimum 50 ms).
+# Without a parameter the defaults (300 ms and 2000 ms) are used.
+mosquitto_pub -h <broker> -t clock/mode/set -m "sprint 150"
+mosquitto_pub -h <broker> -t clock/mode/set -m "crawl 500"
 ```
 
 Mode changes take effect when the current revolution completes (after 60
@@ -152,5 +157,5 @@ Constants at the top of `src/main.cpp`:
 | `PULSE_MS` | 31 | Coil pulse duration in ms |
 | `PULSES_PER_REVOLUTION` | 60 | Ticks per full revolution of the second hand |
 | `TICK_COUNT` | 59 | Number of ticks governed by the tick duration table per minute |
-| `SPRINT_GAP_MS` | 269 | Gap after each pulse in sprint mode (300 ms total tick) |
-| `CRAWL_GAP_MS` | 1969 | Gap after each pulse in crawl mode (2000 ms total tick) |
+| `SPRINT_DEFAULT_MS` | 300 | Default total tick duration in sprint mode when no parameter is given |
+| `CRAWL_DEFAULT_MS` | 2000 | Default total tick duration in crawl mode when no parameter is given |

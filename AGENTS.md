@@ -1,5 +1,11 @@
 # Sleight of hand
 
+## Architecture reference
+
+`ARCHITECTURE.md` is the authoritative reference for how the system works. Read it
+before exploring the repo — it will answer most structural questions faster than
+grepping. After any change that affects architecture, update `ARCHITECTURE.md` to
+reflect the new state.
 
 ## Code concerns
 
