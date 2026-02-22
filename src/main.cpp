@@ -15,6 +15,7 @@ constexpr uint32_t PULSE_MS = 31;
 
 constexpr uint32_t SPRINT_DEFAULT_MS = 300;
 constexpr uint32_t CRAWL_DEFAULT_MS = 2000;
+constexpr uint32_t CALIBRATE_SPRINT_MS = 200;
 
 constexpr uint8_t TICK_COUNT = 59;
 
@@ -296,6 +297,44 @@ static void onMqttMessage(char* topic, byte* payload, unsigned int length) {
     return;
   }
 
+  if (strncmp(buffer, "calibrate ", 10) == 0) {
+    char* endptr;
+    uint32_t position = (uint32_t)strtoul(buffer + 10, &endptr, 10);
+    if (endptr == buffer + 10) {
+      logMessagef("Unknown command: %s", buffer);
+      return;
+    }
+    if (position >= 60) {
+      logMessagef("Unknown command: %s", buffer);
+      return;
+    }
+    if (position == 0) {
+      // Already at p00: stop and wait for the next minute boundary to re-sync.
+      // No sprint needed because the hand is already in position.
+      stopped = true;
+      start_at_minute_pending = true;
+      stop_at_top_pending = false;
+      mode_change_pending = false;
+      logMessage("Calibrate: at p00, waiting for minute boundary.");
+    } else {
+      // Set pulse_index to the known position so the sprint loop counts the
+      // remaining pulses correctly and wraps at exactly p00. This is one of
+      // the four sanctioned pulse_index reset points (see ARCHITECTURE.md).
+      pulse_index = (uint16_t)position;
+      positioning_tick_ms = CALIBRATE_SPRINT_MS;
+      current_mode = TickMode::sprint;
+      stopped = false;
+      start_at_minute_pending = false;
+      stop_at_top_pending = false;
+      pending_mode = last_timekeeping_mode;
+      mode_change_pending = true;
+      logMessagef("Calibrate: sprinting from p%02u to p00, then resuming %s.",
+                  position, modeToString(last_timekeeping_mode));
+      publishCurrentMode();
+    }
+    return;
+  }
+
   // Check for positioning modes with an optional tick-duration parameter
   // (e.g. "sprint 150" or "crawl 500"). This must happen before stringToMode()
   // so the bare name still works for all other callers of stringToMode().
@@ -305,12 +344,12 @@ static void onMqttMessage(char* topic, byte* payload, unsigned int length) {
     parameterized_mode = TickMode::sprint;
     has_parameterized_mode = true;
     uint32_t requested_ms = (uint32_t)strtoul(buffer + 7, nullptr, 10);
-    positioning_tick_ms = requested_ms < 50 ? 50 : requested_ms;
+    positioning_tick_ms = requested_ms < 100 ? 100 : requested_ms;
   } else if (strncmp(buffer, "crawl ", 6) == 0) {
     parameterized_mode = TickMode::crawl;
     has_parameterized_mode = true;
     uint32_t requested_ms = (uint32_t)strtoul(buffer + 6, nullptr, 10);
-    positioning_tick_ms = requested_ms < 50 ? 50 : requested_ms;
+    positioning_tick_ms = requested_ms < 100 ? 100 : requested_ms;
   }
 
   if (has_parameterized_mode) {

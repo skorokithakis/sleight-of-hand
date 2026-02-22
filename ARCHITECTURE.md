@@ -77,32 +77,33 @@ Default mode on boot: `vetinari`.
 
 - `minute_start_ms` holds the `millis()` timestamp of the current minute boundary (`src/main.cpp` line 100)
 - All timekeeping modes produce exactly 60 pulses per minute, anchored to NTP
-- **Pulse 59 (the last pulse)** is special: the loop spins until `millis() - minute_start_ms >= 60000`, then fires the pulse and calls `onRevolutionComplete()` (`src/main.cpp` lines 556–563)
+- **Pulse 59 (the last pulse)** is special: the loop spins until `millis() - minute_start_ms >= 60000`, then fires the pulse and calls `onRevolutionComplete()` (`src/main.cpp` lines 590–597)
 - After `onRevolutionComplete()`, `minute_start_ms += 60000` (not re-read from NTP) to avoid drift from NTP query latency
-- `startNewMinute()` resets `pulse_index = 0` and refills `tick_durations` (`src/main.cpp` lines 425–428)
+- `startNewMinute()` resets `pulse_index = 0` and refills `tick_durations` (`src/main.cpp` lines 459–462)
 - `getMsIntoMinute()` reads `gettimeofday()` and returns `tm_sec * 1000 + tv_usec / 1000` (`src/main.cpp` lines 242–248)
-- On boot, the firmware waits for `getMsIntoMinute() < 1000` (i.e. the first second of a new minute) before starting (`src/main.cpp` lines 496–539)
+- On boot, the firmware waits for `getMsIntoMinute() < 1000` (i.e. the first second of a new minute) before starting (`src/main.cpp` lines 530–573)
 - `start_at_minute_pending` flag drives this wait; it is set on boot and whenever switching from a positioning mode back to a timekeeping mode
 
 ### Sprint and crawl (positioning modes)
 
 - Activate immediately when commanded, bypassing the revolution-boundary queue
 - Both modes accept an optional tick-duration parameter in milliseconds (e.g. `sprint 150`, `crawl 500`). The value is clamped to a minimum of 50 ms. Without a parameter, `SPRINT_DEFAULT_MS` (300) or `CRAWL_DEFAULT_MS` (2000) is used.
-- Run continuously without NTP sync: `pulseOnce()` + `delay(positioning_tick_ms - PULSE_MS)`, wrapping `pulse_index` at `PULSES_PER_REVOLUTION` (`src/main.cpp` lines 565–575)
-- When switching back to a timekeeping mode, `onRevolutionComplete()` sets `stopped = true` and `start_at_minute_pending = true`, so the clock waits for the next NTP minute boundary before resuming (`src/main.cpp` lines 414–420)
+- Run continuously without NTP sync: `pulseOnce()` + `delay(positioning_tick_ms - PULSE_MS)`, wrapping `pulse_index` at `PULSES_PER_REVOLUTION` (`src/main.cpp` lines 599–609)
+- When switching back to a timekeeping mode, `onRevolutionComplete()` sets `stopped = true` and `start_at_minute_pending = true`, so the clock waits for the next NTP minute boundary before resuming (`src/main.cpp` lines 448–454)
 
 ### `pulse_index` invariant
 
 `pulse_index` must **only** be reset by:
-1. The `start` MQTT command (`src/main.cpp` line 279)
-2. `startNewMinute()` at each minute boundary (`src/main.cpp` line 426)
-3. The positioning-mode wrap in `loop()` (`src/main.cpp` line 573) — this is the only other reset, and it is intentional for sprint/crawl which run without NTP sync
+1. The `start` MQTT command (`src/main.cpp` line 280)
+2. `startNewMinute()` at each minute boundary (`src/main.cpp` line 460)
+3. The positioning-mode wrap in `loop()` (`src/main.cpp` line 607) — this is the only other reset, and it is intentional for sprint/crawl which run without NTP sync
+4. The `calibrate <position>` MQTT command — sets `pulse_index` to the user-supplied position so the sprint loop counts the remaining pulses correctly and wraps at exactly p00. This is intentional: the user is asserting the physical hand position.
 
 It must never be reset elsewhere. This is a hard constraint from `AGENTS.md`.
 
 ### MQTT command handling
 
-All commands arrive on topic `clock/mode/set` via `onMqttMessage()` (`src/main.cpp` lines 259–365).
+All commands arrive on topic `clock/mode/set` via `onMqttMessage()` (`src/main.cpp` lines 260–399).
 
 Control commands (handled first, before mode parsing):
 
@@ -112,6 +113,7 @@ Control commands (handled first, before mode parsing):
 | `start` | Sets `stopped = false`, resets `pulse_index = 0`, sets `minute_start_ms = millis()` |
 | `start_at_minute` | Sets `start_at_minute_pending = true`, clears `stop_at_top_pending` |
 | `stop_at_top` | Sets `stop_at_top_pending = true`, clears `start_at_minute_pending` |
+| `calibrate <position>` | Sets `pulse_index` to the given position (0–59), then sprints to p00 and queues a return to `last_timekeeping_mode`. Position 0 skips sprint and waits for the minute boundary directly. Position ≥ 60 is rejected. |
 
 Mode commands (parsed by `stringToMode()` for bare names, or by prefix matching for parameterized forms):
 
@@ -124,7 +126,7 @@ Current mode is published retained to `clock/mode/state` after every change.
 
 ### MQTT idle window
 
-MQTT (re)connection is only attempted when `stopped` is true or `pulse_index == 59` (the idle wait at the minute boundary), so a slow broker never stalls pulse timing (`src/main.cpp` lines 506–509).
+MQTT (re)connection is only attempted when `stopped` is true or `pulse_index == 59` (the idle wait at the minute boundary), so a slow broker never stalls pulse timing (`src/main.cpp` lines 540–543).
 
 ### Error handling
 
@@ -163,7 +165,7 @@ No linting, formatting, or testing infrastructure. This is typical for embedded 
 
 ## Project structure hotspots
 
-- `src/main.cpp` (576 lines) — Full firmware: WiFi, NTP, MQTT, all tick modes, minute-boundary synchronization. The only file that matters for production.
+- `src/main.cpp` (610 lines) — Full firmware: WiFi, NTP, MQTT, all tick modes, minute-boundary synchronization. The only file that matters for production.
 - `src/simple.cpp` (53 lines) — Minimal test firmware for verifying motor operation without network complexity.
 - `platformio.ini` — Build configuration with two active environments.
 - `README.md` — Comprehensive documentation of hardware, modes, MQTT API, and configuration constants.
@@ -184,37 +186,37 @@ No linting, formatting, or testing infrastructure. This is typical for embedded 
 ### Do: Anchor all timekeeping to `minute_start_ms`, not raw `millis()`
 
 Pulse scheduling for timekeeping modes is relative to `minute_start_ms`, which is set once at the minute boundary and incremented by exactly 60000 ms each revolution. This prevents drift from loop jitter or NTP query latency.
-- Evidence: `src/main.cpp` lines 100, 535, 557
+- Evidence: `src/main.cpp` lines 101, 569, 591
 
 ### Do: Defer blocking operations to the idle window
 
 MQTT reconnection only happens when `stopped || pulse_index == 59`. The blocking `connect()` call cannot stall pulse timing.
-- Evidence: `src/main.cpp` lines 506–509
+- Evidence: `src/main.cpp` lines 540–543
 
 ### Do: Apply timekeeping mode changes at revolution boundaries
 
 Timekeeping mode changes are queued in `pending_mode` / `mode_change_pending` and applied in `onRevolutionComplete()`, so the clock never starts a new mode mid-revolution.
-- Evidence: `src/main.cpp` lines 69–71, 398–421
+- Evidence: `src/main.cpp` lines 70–72, 432–456
 
 ### Do: Activate positioning modes immediately
 
-Sprint and crawl bypass the revolution-boundary queue because they don't need NTP sync. All pending blocking state (`start_at_minute_pending`, `stop_at_top_pending`) is cleared.
-- Evidence: `src/main.cpp` lines 330–345
+Positioning modes (`sprint`, `crawl`) bypass the revolution-boundary queue because they don't need NTP sync. All pending blocking state (`start_at_minute_pending`, `stop_at_top_pending`) is cleared.
+- Evidence: `src/main.cpp` lines 364–379
 
 ### Do: Re-sync to NTP after leaving a positioning mode
 
 When switching from sprint/crawl back to a timekeeping mode, `onRevolutionComplete()` sets `start_at_minute_pending = true` so the clock waits for the next minute boundary.
-- Evidence: `src/main.cpp` lines 414–420
+- Evidence: `src/main.cpp` lines 448–454
 
 ### Do: Fall back to `last_timekeeping_mode` at minute boundary if in a positioning mode
 
 If `start_at_minute_pending` fires while `current_mode` is sprint or crawl, the clock falls back to `last_timekeeping_mode` rather than running an unsynchronized positioning mode.
-- Evidence: `src/main.cpp` lines 524–531
+- Evidence: `src/main.cpp` lines 558–565
 
-### Don't: Reset `pulse_index` except in `start`, `startNewMinute()`, or the positioning-mode wrap
+### Don't: Reset `pulse_index` except in `start`, `startNewMinute()`, the positioning-mode wrap, or `calibrate`
 
 Resetting `pulse_index` at any other point breaks NTP synchronization. This is an explicit constraint in `AGENTS.md`.
-- Evidence: `AGENTS.md` line 6, `src/main.cpp` lines 279, 426, 573
+- Evidence: `AGENTS.md` line 6, `src/main.cpp` lines 280, 460, 607, 318
 
 ### Don't: Read NTP time to advance `minute_start_ms`
 
@@ -224,7 +226,7 @@ Resetting `pulse_index` at any other point breaks NTP synchronization. This is a
 ### Don't: Block the main loop during active pulsing
 
 All delays are calculated from gap constants or `tick_durations[]`, not arbitrary waits. MQTT operations are deferred. The only intentional blocking `delay()` calls are the pulse duration itself and the inter-pulse gap.
-- Evidence: `src/main.cpp` lines 551–552, 569–570
+- Evidence: `src/main.cpp` lines 585–586, 603–604
 
 
 ## Open questions
