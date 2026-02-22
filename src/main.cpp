@@ -7,8 +7,8 @@
 #include <driver/gpio.h>
 #include <time.h>
 
-constexpr int PIN_COIL_A = 4;
-constexpr int PIN_COIL_B = 5;
+constexpr int PIN_COIL_A = 5;
+constexpr int PIN_COIL_B = 6;
 constexpr uint16_t PULSES_PER_REVOLUTION = 60;
 
 constexpr uint32_t PULSE_MS = 31;

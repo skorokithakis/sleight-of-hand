@@ -37,6 +37,7 @@ The firmware drives a Lavet motor with alternating-polarity 31 ms pulses, one pe
 - Default tick durations for positioning modes (`src/main.cpp` lines 16–17):
   - `SPRINT_DEFAULT_MS` = 300 ms total tick (used when no parameter is given)
   - `CRAWL_DEFAULT_MS` = 2000 ms total tick (used when no parameter is given)
+  - `CALIBRATE_SPRINT_MS` = 200 ms total tick (fixed speed used during `calibrate` sprints; not user-configurable)
 - `positioning_tick_ms` (`src/main.cpp` line 79): runtime variable holding the active tick duration for the current positioning mode; set on every sprint/crawl activation
 
 Timekeeping modes use `tick_durations[]` (total wall-clock duration per tick, including the pulse). The gap after the pulse is `tick_durations[pulse_index] - PULSE_MS`.
@@ -118,7 +119,7 @@ Control commands (handled first, before mode parsing):
 Mode commands (parsed by `stringToMode()` for bare names, or by prefix matching for parameterized forms):
 
 - Positioning modes (`sprint`, `crawl`): applied immediately, all blocking state cleared; `positioning_tick_ms` is set to the default (`SPRINT_DEFAULT_MS` or `CRAWL_DEFAULT_MS`)
-- Positioning modes with duration (`sprint <ms>`, `crawl <ms>`): same as above, but `positioning_tick_ms` is set to the given value, clamped to a minimum of 50 ms
+- Positioning modes with duration (`sprint <ms>`, `crawl <ms>`): same as above, but `positioning_tick_ms` is set to the given value, clamped to a minimum of 100 ms
 - Timekeeping modes when `stopped`: applied immediately, `start_at_minute_pending = true`
 - Timekeeping modes when running: queued in `pending_mode` / `mode_change_pending`, applied at next revolution boundary via `onRevolutionComplete()`
 
@@ -127,6 +128,12 @@ Current mode is published retained to `clock/mode/state` after every change.
 ### MQTT idle window
 
 MQTT (re)connection is only attempted when `stopped` is true or `pulse_index == 59` (the idle wait at the minute boundary), so a slow broker never stalls pulse timing (`src/main.cpp` lines 540–543).
+
+### GPIO drive strength
+
+- `main.cpp` sets `GPIO_DRIVE_CAP_0` (5 mA) on both coil pins — the minimum, because the 820 Ω series resistor limits current to ~4 mA at 3.3 V anyway.
+- `simple.cpp` sets `GPIO_DRIVE_CAP_2` (20 mA) — higher drive for bench testing without the series resistor.
+- Evidence: `src/main.cpp` lines 477–478, `src/simple.cpp` lines 39–40
 
 ### Error handling
 
@@ -165,15 +172,17 @@ No linting, formatting, or testing infrastructure. This is typical for embedded 
 
 ## Project structure hotspots
 
-- `src/main.cpp` (610 lines) — Full firmware: WiFi, NTP, MQTT, all tick modes, minute-boundary synchronization. The only file that matters for production.
+- `src/main.cpp` (615 lines) — Full firmware: WiFi, NTP, MQTT, all tick modes, minute-boundary synchronization. The only file that matters for production.
 - `src/simple.cpp` (53 lines) — Minimal test firmware for verifying motor operation without network complexity.
 - `platformio.ini` — Build configuration with two active environments.
 - `README.md` — Comprehensive documentation of hardware, modes, MQTT API, and configuration constants.
 - `AGENTS.md` — Development constraints (especially the `pulse_index` reset rule) and documentation maintenance rules.
-- `misc/coding-team/` — Task spec documents for AI coding agents; not compiled. Three completed task series:
+- `misc/coding-team/` — Task spec documents for AI coding agents; not compiled. Five completed task series:
   - `ticking-mode-refactor/` — Replaced 960-pulse/16-burst model with 60-pulse/gap model
   - `centralized-tick-table/` — Introduced `tick_durations[]` table and p00/t00 terminology
   - `sprint-crawl-immediate-start/` — Made positioning modes activate immediately and added `last_timekeeping_mode` fallback
+  - `sprint-crawl-parameter/` — Added optional tick-duration parameter to sprint/crawl commands
+  - `calibrate-command/` — Added `calibrate <position>` command for hand re-synchronization
 
 **Key boundaries**:
 - `src/` — all application code; no shared headers between the two source files
@@ -216,7 +225,7 @@ If `start_at_minute_pending` fires while `current_mode` is sprint or crawl, the 
 ### Don't: Reset `pulse_index` except in `start`, `startNewMinute()`, the positioning-mode wrap, or `calibrate`
 
 Resetting `pulse_index` at any other point breaks NTP synchronization. This is an explicit constraint in `AGENTS.md`.
-- Evidence: `AGENTS.md` line 6, `src/main.cpp` lines 280, 460, 607, 318
+- Evidence: `AGENTS.md` line 6, `src/main.cpp` lines 280, 460, 612, 323
 
 ### Don't: Read NTP time to advance `minute_start_ms`
 
