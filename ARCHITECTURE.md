@@ -46,10 +46,12 @@ Timekeeping modes use `tick_durations[]` (total wall-clock duration per tick, in
 | `steady` | Timekeeping | Yes | At next revolution boundary |
 | `rush_wait` | Timekeeping | Yes | At next revolution boundary |
 | `vetinari` | Timekeeping | Yes | At next revolution boundary |
+| `hesitate` | Timekeeping | Yes | At next revolution boundary |
+| `stumble` | Timekeeping | Yes | At next revolution boundary |
 | `sprint` | Positioning | No | Immediately |
 | `crawl` | Positioning | No | Immediately |
 
-`isTimekeeping()` (`src/main.cpp` line 171) returns true for steady/rush_wait/vetinari and false for sprint/crawl.
+`isTimekeeping()` (`src/main.cpp` line 171) returns true for steady/rush_wait/vetinari/hesitate/stumble and false for sprint/crawl.
 
 Default mode on boot: `vetinari`.
 
@@ -60,6 +62,8 @@ Default mode on boot: `vetinari`.
 - `steady`: all 59 entries = 1000 ms
 - `rush_wait`: all 59 entries = 932 ms (~55 s total, ~5 s idle before minute boundary)
 - `vetinari`: Fisher-Yates shuffle of `VETINARI_TEMPLATE` (534–2001 ms, sorted ascending in the template)
+- `hesitate`: 58 entries of 980 ms and 1 entry of 2000 ms, Fisher-Yates shuffled each minute
+- `stumble`: 58 entries of 1010 ms and 1 entry of 420 ms, Fisher-Yates shuffled each minute
 - Positioning modes: table is not used
 
 ### Vetinari mode
@@ -70,6 +74,16 @@ Default mode on boot: `vetinari`.
 - Shuffled each minute via Fisher-Yates into `tick_durations[]` (`src/main.cpp` lines 211–217)
 - `getGapMs()` does not exist; the gap is computed inline as `tick_durations[pulse_index] - PULSE_MS`
 - Index 59 (the 60th pulse) never reads `tick_durations` — it waits for the NTP boundary instead
+
+### Hesitate and stumble modes
+
+Both modes follow the same structure as vetinari — 59 programmatically generated entries shuffled each minute — but use a simpler two-value tick table rather than a hand-crafted template.
+
+**Hesitate**: 58 entries of 980 ms and 1 entry of 2000 ms. The single long tick lands at a random position each minute, causing the hand to pause noticeably for ~2 seconds before continuing.
+
+**Stumble**: 58 entries of 1010 ms and 1 entry of 420 ms. The single short tick lands at a random position each minute, causing the hand to jump forward quickly as if stumbling.
+
+Both tables sum to the same ~58 s total as the other timekeeping modes, leaving the remainder as idle time before the NTP-anchored 60th pulse.
 
 ### Timing and minute synchronization
 
@@ -171,12 +185,13 @@ No linting, formatting, or testing infrastructure. This is typical for embedded 
 - `platformio.ini` — Build configuration with one active environment (`vetinari`).
 - `README.md` — Comprehensive documentation of hardware, modes, MQTT API, and configuration constants.
 - `AGENTS.md` — Development constraints (especially the `pulse_index` reset rule) and documentation maintenance rules.
-- `misc/coding-team/` — Task spec documents for AI coding agents; not compiled. Five completed task series:
+- `misc/coding-team/` — Task spec documents for AI coding agents; not compiled. Six completed task series:
   - `ticking-mode-refactor/` — Replaced 960-pulse/16-burst model with 60-pulse/gap model
   - `centralized-tick-table/` — Introduced `tick_durations[]` table and p00/t00 terminology
   - `sprint-crawl-immediate-start/` — Made positioning modes activate immediately and added `last_timekeeping_mode` fallback
   - `sprint-crawl-parameter/` — Added optional tick-duration parameter to sprint/crawl commands
   - `calibrate-command/` — Added `calibrate <position>` command for hand re-synchronization
+  - `pin-change-status-print-cleanup/` — Changed coil pins from 4/5 to 5/6, added per-tick status logging, removed `simple.cpp` and its build environment
 
 **Key boundaries**:
 - `src/` — all application code; single source file with no shared headers
@@ -234,4 +249,4 @@ All delays are calculated from gap constants or `tick_durations[]`, not arbitrar
 
 ## Open questions
 
-1. **Sprint/crawl default tick duration**: `SPRINT_DEFAULT_MS` = 300 ms and `CRAWL_DEFAULT_MS` = 2000 ms. An earlier task spec (`misc/coding-team/ticking-mode-refactor/001-refactor-pulse-timing.md`) specified 500 ms for sprint, but the current source and docs are consistent with 300 ms. No discrepancy in the current codebase.
+1. **README pin numbers are stale**: `README.md` still documents `PIN_COIL_A = 4` and `PIN_COIL_B = 5`, but the source was changed to 5 and 6 by the `pin-change-status-print-cleanup` task. The README hardware wiring diagram needs updating to reflect GPIO 5 and 6.

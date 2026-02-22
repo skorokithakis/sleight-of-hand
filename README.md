@@ -38,14 +38,7 @@ Requires [PlatformIO](https://platformio.org/).
 # Full firmware (WiFi, NTP, MQTT, tick modes)
 pio run -e vetinari
 pio run -e vetinari -t upload
-
-# Simple test firmware (continuous ticking, no WiFi)
-pio run -e simple
-pio run -e simple -t upload
 ```
-
-The simple environment is useful for verifying that the motor steps correctly
-before adding network complexity.
 
 
 ## First boot
@@ -79,6 +72,8 @@ Each timekeeping mode defines the 59-element `tick_durations` array.
 | `steady` | 59 ticks at 1000 ms each. The hand advances once per second, with ~1 s idle at the minute boundary. |
 | `rush_wait` | 59 ticks at 932 ms each. Completes in ~55 s, then idles ~5 s until the next minute boundary. |
 | `vetinari` | 59 ticks with shuffled irregular durations (534–2001 ms). The hand visibly speeds up and slows down, but completes the minute on time. Reshuffled every minute. |
+| `hesitate` | 58 ticks at 980 ms, 1 tick at 2000 ms, shuffled each minute. The hand pauses for ~2 seconds at a random position each minute, creating a noticeable hesitation somewhere in the revolution. |
+| `stumble` | 58 ticks at 1010 ms, 1 tick at 420 ms, shuffled each minute. The hand skips forward quickly at a random position each minute, as if stumbling. |
 | `sprint` | Continuous ticking at a configurable duration (default 300 ms per tick). For quickly advancing the hand to a target position. Activates immediately; not NTP-anchored. |
 | `crawl` | Continuous ticking at a configurable duration (default 2000 ms per tick). For precisely positioning the hand at 12 o'clock. Activates immediately; not NTP-anchored. |
 
@@ -100,6 +95,8 @@ The clock subscribes to `clock/mode/set` and publishes the current mode to
 mosquitto_pub -h <broker> -t clock/mode/set -m "rush_wait"
 mosquitto_pub -h <broker> -t clock/mode/set -m "steady"
 mosquitto_pub -h <broker> -t clock/mode/set -m "vetinari"
+mosquitto_pub -h <broker> -t clock/mode/set -m "hesitate"
+mosquitto_pub -h <broker> -t clock/mode/set -m "stumble"
 mosquitto_pub -h <broker> -t clock/mode/set -m "sprint"
 mosquitto_pub -h <broker> -t clock/mode/set -m "crawl"
 

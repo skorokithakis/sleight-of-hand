@@ -34,3 +34,5 @@ information" section.
 
 
 ## Saved information
+
+- When finishing a feature, always `jj describe` it.

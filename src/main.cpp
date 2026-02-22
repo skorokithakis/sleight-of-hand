@@ -63,6 +63,8 @@ enum class TickMode : uint8_t {
   steady,
   rush_wait,
   vetinari,
+  hesitate,
+  stumble,
   sprint,
   crawl,
 };
@@ -137,6 +139,10 @@ static const char* modeToString(TickMode mode) {
       return "rush_wait";
     case TickMode::vetinari:
       return "vetinari";
+    case TickMode::hesitate:
+      return "hesitate";
+    case TickMode::stumble:
+      return "stumble";
     case TickMode::sprint:
       return "sprint";
     case TickMode::crawl:
@@ -156,6 +162,14 @@ static bool stringToMode(const char* str, TickMode& out) {
   }
   if (strcmp(str, "vetinari") == 0) {
     out = TickMode::vetinari;
+    return true;
+  }
+  if (strcmp(str, "hesitate") == 0) {
+    out = TickMode::hesitate;
+    return true;
+  }
+  if (strcmp(str, "stumble") == 0) {
+    out = TickMode::stumble;
     return true;
   }
   if (strcmp(str, "sprint") == 0) {
@@ -210,6 +224,32 @@ static void fillTickDurations() {
       break;
     case TickMode::vetinari:
       memcpy(tick_durations, VETINARI_TEMPLATE, sizeof(tick_durations));
+      for (int i = TICK_COUNT - 1; i > 0; i--) {
+        int j = esp_random() % (i + 1);
+        uint16_t temporary = tick_durations[i];
+        tick_durations[i] = tick_durations[j];
+        tick_durations[j] = temporary;
+      }
+      break;
+    case TickMode::hesitate:
+      // 58 ticks at 980ms, 1 tick at 2000ms. Total: 58*980 + 2000 = 58840ms.
+      for (uint8_t i = 0; i < TICK_COUNT; i++) {
+        tick_durations[i] = 980;
+      }
+      tick_durations[0] = 2000;
+      for (int i = TICK_COUNT - 1; i > 0; i--) {
+        int j = esp_random() % (i + 1);
+        uint16_t temporary = tick_durations[i];
+        tick_durations[i] = tick_durations[j];
+        tick_durations[j] = temporary;
+      }
+      break;
+    case TickMode::stumble:
+      // 58 ticks at 1010ms, 1 tick at 420ms. Total: 58*1010 + 420 = 59000ms.
+      for (uint8_t i = 0; i < TICK_COUNT; i++) {
+        tick_durations[i] = 1010;
+      }
+      tick_durations[0] = 420;
       for (int i = TICK_COUNT - 1; i > 0; i--) {
         int j = esp_random() % (i + 1);
         uint16_t temporary = tick_durations[i];
