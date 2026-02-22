@@ -3,7 +3,7 @@
 ## Detected stack
 
 - **Languages**: C++ (Arduino framework)
-  - Evidence: `src/main.cpp`, `src/simple.cpp`
+  - Evidence: `src/main.cpp`
 - **Platform**: ESP32-C3 microcontroller (espressif32)
   - Evidence: `platformio.ini` lines 2–3, board `esp32-c3-devkitm-1`
 - **Framework**: Arduino
@@ -21,11 +21,8 @@
 
 ### Build environments
 
-Two active build targets defined in `platformio.ini`:
-- `vetinari`: Full firmware with WiFi, NTP, MQTT, and all tick modes (excludes `simple.cpp` and `counting.cpp`)
-- `simple`: Test firmware with continuous 1 s ticking, no network features (excludes `main.cpp` and `counting.cpp`)
-
-Note: `counting.cpp` is referenced in `build_src_filter` exclusions but does not exist in `src/` and has no `[env:counting]` section. It is a dead reference.
+One active build target defined in `platformio.ini`:
+- `vetinari`: Full firmware with WiFi, NTP, MQTT, and all tick modes.
 
 ### Pulse model
 
@@ -131,9 +128,8 @@ MQTT (re)connection is only attempted when `stopped` is true or `pulse_index == 
 
 ### GPIO drive strength
 
-- `main.cpp` sets `GPIO_DRIVE_CAP_0` (5 mA) on both coil pins — the minimum, because the 820 Ω series resistor limits current to ~4 mA at 3.3 V anyway.
-- `simple.cpp` sets `GPIO_DRIVE_CAP_2` (20 mA) — higher drive for bench testing without the series resistor.
-- Evidence: `src/main.cpp` lines 477–478, `src/simple.cpp` lines 39–40
+- Both coil pins (GPIO 5 and 6) are set to `GPIO_DRIVE_CAP_0` (5 mA) — the minimum, because the 820 Ω series resistor limits current to ~4 mA at 3.3 V anyway.
+- Evidence: `src/main.cpp` lines 477–478
 
 ### Error handling
 
@@ -147,6 +143,7 @@ MQTT (re)connection is only attempted when `stopped` is true or `pulse_index == 
 - UDP logging only when WiFi is connected
 - Format: `(millis - IP): message`
 - Helpers: `logMessage()` and `logMessagef()` (`src/main.cpp` lines 104–127)
+- Per-tick status line logged after every pulse: `tick <pulse_index> t=<duration_ms> time=HH:MM:SS.cc` (pulse 59 logs `t=0` since it has no `tick_durations` entry — it waits for the NTP boundary instead)
 
 ### Configuration storage
 
@@ -162,8 +159,6 @@ No linting, formatting, or testing infrastructure. This is typical for embedded 
 **Build commands** (from `platformio.ini` and PlatformIO conventions):
 - `pio run -e vetinari` — build full firmware
 - `pio run -e vetinari -t upload` — upload to device
-- `pio run -e simple` — build simple test firmware
-- `pio run -e simple -t upload` — upload simple test firmware
 
 **Monitoring**:
 - Serial: `pio device monitor`
@@ -172,9 +167,8 @@ No linting, formatting, or testing infrastructure. This is typical for embedded 
 
 ## Project structure hotspots
 
-- `src/main.cpp` (615 lines) — Full firmware: WiFi, NTP, MQTT, all tick modes, minute-boundary synchronization. The only file that matters for production.
-- `src/simple.cpp` (53 lines) — Minimal test firmware for verifying motor operation without network complexity.
-- `platformio.ini` — Build configuration with two active environments.
+- `src/main.cpp` (615 lines) — Full firmware: WiFi, NTP, MQTT, all tick modes, minute-boundary synchronization.
+- `platformio.ini` — Build configuration with one active environment (`vetinari`).
 - `README.md` — Comprehensive documentation of hardware, modes, MQTT API, and configuration constants.
 - `AGENTS.md` — Development constraints (especially the `pulse_index` reset rule) and documentation maintenance rules.
 - `misc/coding-team/` — Task spec documents for AI coding agents; not compiled. Five completed task series:
@@ -185,7 +179,7 @@ No linting, formatting, or testing infrastructure. This is typical for embedded 
   - `calibrate-command/` — Added `calibrate <position>` command for hand re-synchronization
 
 **Key boundaries**:
-- `src/` — all application code; no shared headers between the two source files
+- `src/` — all application code; single source file with no shared headers
 - `.pio/` — build artifacts (gitignored)
 - `misc/coding-team/` — task specs for AI coding agents; not compiled
 
@@ -240,6 +234,4 @@ All delays are calculated from gap constants or `tick_durations[]`, not arbitrar
 
 ## Open questions
 
-1. **`counting` environment missing from `platformio.ini`**: `build_src_filter` in both environments excludes `counting.cpp`, but no `[env:counting]` section exists and `src/counting.cpp` does not exist. This is a dead reference that can be removed from `build_src_filter` if the counting firmware is no longer planned.
-
-2. **Sprint/crawl default tick duration**: `SPRINT_DEFAULT_MS` = 300 ms and `CRAWL_DEFAULT_MS` = 2000 ms. An earlier task spec (`misc/coding-team/ticking-mode-refactor/001-refactor-pulse-timing.md`) specified 500 ms for sprint, but the current source and docs are consistent with 300 ms. No discrepancy in the current codebase.
+1. **Sprint/crawl default tick duration**: `SPRINT_DEFAULT_MS` = 300 ms and `CRAWL_DEFAULT_MS` = 2000 ms. An earlier task spec (`misc/coding-team/ticking-mode-refactor/001-refactor-pulse-timing.md`) specified 500 ms for sprint, but the current source and docs are consistent with 300 ms. No discrepancy in the current codebase.

@@ -588,6 +588,16 @@ void loop() {
       // otherwise we'd read one past the end of the array.
       uint16_t duration = tick_durations[pulse_index];
       pulseOnce();
+
+      struct timeval tv;
+      gettimeofday(&tv, nullptr);
+      struct tm timeinfo;
+      localtime_r(&tv.tv_sec, &timeinfo);
+      logMessagef("tick %u t=%u time=%02d:%02d:%02d.%02ld",
+                  pulse_index, duration,
+                  timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_sec,
+                  tv.tv_usec / 10000);
+
       delay(duration - PULSE_MS);
     } else {
       // Pulse 59: wait for the NTP minute boundary before firing, so the hand
@@ -595,6 +605,17 @@ void loop() {
       if (now - minute_start_ms >= 60000) {
         minute_start_ms += 60000;
         pulseOnce();
+
+        struct timeval tv;
+        gettimeofday(&tv, nullptr);
+        struct tm timeinfo;
+        localtime_r(&tv.tv_sec, &timeinfo);
+        // t=0 because pulse 59 is the NTP-wait pulse with no tick_durations entry.
+        logMessagef("tick %u t=0 time=%02d:%02d:%02d.%02ld",
+                    pulse_index,
+                    timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_sec,
+                    tv.tv_usec / 10000);
+
         onRevolutionComplete();
         if (!stopped) {
           startNewMinute();
