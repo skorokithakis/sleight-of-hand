@@ -9,53 +9,32 @@
 
 constexpr int PIN_COIL_A = 4;
 constexpr int PIN_COIL_B = 5;
-constexpr uint16_t PULSES_PER_REVOLUTION = 960;
+constexpr uint16_t PULSES_PER_REVOLUTION = 60;
 
-// Set to true for a ticking movement (one pulse per second), false for a
-// sweeping movement (continuous motion).
-#define TICKING_MOVEMENT true
-
-#if TICKING_MOVEMENT
 constexpr uint32_t PULSE_MS = 31;
-#else
-constexpr uint32_t PULSE_MS = 30;
-#endif
-// Total time for one pulse cycle (energize + pause) per mode.
-// For sweeping movements, the pulse duration is half the cycle time.
-// For ticking movements, these values are ignored for timekeeping modes.
-constexpr uint32_t STEADY_CYCLE_MS = 62;
-constexpr uint32_t RUSH_CYCLE_MS = 58;
-constexpr uint32_t SPRINT_CYCLE_MS = 32;
-constexpr uint32_t CRAWL_CYCLE_MS = 230;
 
+constexpr uint32_t SPRINT_GAP_MS = 269;
+constexpr uint32_t CRAWL_GAP_MS = 1969;      // 2s total tick
 
-// Vetinari mode: 60 bursts of 16 pulses each, with varying cycle times.
-// The sum of these values is 3625, so 16 * 3625 = 58000 ms per revolution
-// (~2 s idle gap before the next minute boundary). The extra headroom
-// absorbs per-iteration loop overhead (GPIO, MQTT, millis) that would
-// otherwise push the revolution past 60 seconds.
-constexpr uint8_t VETINARI_BURSTS = 60;
-constexpr uint8_t VETINARI_PULSES_PER_BURST = 16;
-constexpr uint8_t VETINARI_TEMPLATE[VETINARI_BURSTS] = {
-     49,  45, 106,  47,  37,  38,  37,  39,  55,  56,  37, 110,
-     55,  54, 115, 106,  40,  38,  48,  55,  56,  47,  40,  57,
-     34,  44, 110,  49, 107,  35,  52,  53,  45,  98,  39,  39,
-     51,  94,  32,  42, 110,  41, 116, 108,  35, 107,  49,  42,
-    109,  36,  54,  38,  37,  56, 104,  34,  55,  38, 117,  48,
+constexpr uint8_t TICK_COUNT = 59;
+
+// Vetinari template values are total wall-clock durations (gap + PULSE_MS).
+// Sorted ascending so that after a Fisher-Yates shuffle the distribution is
+// unpredictable but the total always fits within ~58 s, leaving headroom for
+// the NTP wait.
+constexpr uint16_t VETINARI_TEMPLATE[TICK_COUNT] = {
+     534,  550,  552,  561,  565,  574,  574,  619,  641,  649,
+     685,  686,  687,  693,  694,  697,  700,  742,  743,  744,
+     797,  804,  816,  828,  863,  866,  874,  874,  883,  906,
+     920,  957,  981,  984, 1061, 1077, 1096, 1108, 1129, 1190,
+    1192, 1204, 1211, 1227, 1252, 1268, 1310, 1381, 1381, 1387,
+    1410, 1424, 1488, 1629, 1645, 1684, 1729, 1773, 2001,
 };
 
-// Mutable copy that gets Fisher-Yates shuffled at the start of each minute.
-uint8_t vetinari_cycles[VETINARI_BURSTS];
-
-static void shuffleVetinariCycles() {
-  memcpy(vetinari_cycles, VETINARI_TEMPLATE, sizeof(vetinari_cycles));
-  for (int i = VETINARI_BURSTS - 1; i > 0; i--) {
-    int j = esp_random() % (i + 1);
-    uint8_t tmp = vetinari_cycles[i];
-    vetinari_cycles[i] = vetinari_cycles[j];
-    vetinari_cycles[j] = tmp;
-  }
-}
+// Filled at the start of each minute by fillTickDurations(). Each value is
+// the total wall-clock time from one tick to the next; the loop subtracts
+// PULSE_MS to get the delay after the pulse fires.
+uint16_t tick_durations[TICK_COUNT];
 
 constexpr char NTP_SERVER[] = "pool.ntp.org";
 constexpr long UTC_OFFSET_SECONDS = 0;
@@ -91,6 +70,11 @@ TickMode current_mode = TickMode::vetinari;
 TickMode pending_mode = TickMode::vetinari;
 bool mode_change_pending = false;
 
+// Tracks the last timekeeping mode that was active, so that start_at_minute
+// can fall back to it if current_mode is a positioning mode when the minute
+// boundary fires. Vetinari is the default because it's the power-on mode.
+TickMode last_timekeeping_mode = TickMode::vetinari;
+
 // --- State ---
 
 bool polarity = false;
@@ -100,21 +84,17 @@ uint16_t pulse_index = 0;
 // before restarting at a minute boundary.
 bool stopped = false;
 
-// When true, the clock will start sweeping at the next minute boundary
+// When true, the clock will start at the next minute boundary
 // (i.e. when getMsIntoMinute() wraps past 0).
 bool start_at_minute_pending = false;
 
 // When true, the clock will stop after the current revolution completes
-// (at pulse 960, i.e. the hand is at 12 o'clock).
+// (at pulse 60, i.e. the hand is at 12 o'clock).
 bool stop_at_top_pending = false;
 
 // The millis() timestamp of the current minute boundary. All pulse scheduling
 // is relative to this, so timing stays locked to NTP regardless of loop jitter.
 uint32_t minute_start_ms = 0;
-
-// True while we're in the idle gap between finishing the revolution and the
-// next minute boundary.
-bool waiting_for_minute = false;
 
 // --- Logging ---
 
@@ -211,20 +191,32 @@ static void pulseOnce(uint32_t pulse_ms = PULSE_MS) {
   pulse_index++;
 }
 
-static uint32_t getCycleMs() {
+static void fillTickDurations() {
   switch (current_mode) {
     case TickMode::steady:
-      return STEADY_CYCLE_MS;
+      for (uint8_t i = 0; i < TICK_COUNT; i++) {
+        tick_durations[i] = 1000;
+      }
+      break;
     case TickMode::rush_wait:
-      return RUSH_CYCLE_MS;
+      // 59 pulses in ~55 s leaves ~5 s of idle before the NTP boundary.
+      for (uint8_t i = 0; i < TICK_COUNT; i++) {
+        tick_durations[i] = 932;
+      }
+      break;
     case TickMode::vetinari:
-      return vetinari_cycles[pulse_index / VETINARI_PULSES_PER_BURST];
-    case TickMode::sprint:
-      return SPRINT_CYCLE_MS;
-    case TickMode::crawl:
-      return CRAWL_CYCLE_MS;
+      memcpy(tick_durations, VETINARI_TEMPLATE, sizeof(tick_durations));
+      for (int i = TICK_COUNT - 1; i > 0; i--) {
+        int j = esp_random() % (i + 1);
+        uint16_t temporary = tick_durations[i];
+        tick_durations[i] = tick_durations[j];
+        tick_durations[j] = temporary;
+      }
+      break;
+    default:
+      // Positioning modes (sprint/crawl) don't use the tick_durations table.
+      break;
   }
-  return STEADY_CYCLE_MS;
 }
 
 // --- NTP ---
@@ -282,7 +274,6 @@ static void onMqttMessage(char* topic, byte* payload, unsigned int length) {
     stopped = false;
     start_at_minute_pending = false;
     pulse_index = 0;
-    waiting_for_minute = false;
     minute_start_ms = millis();
     logMessage("Clock started immediately.");
     return;
@@ -306,16 +297,21 @@ static void onMqttMessage(char* topic, byte* payload, unsigned int length) {
   if (stringToMode(buffer, requested)) {
     if (!isTimekeeping(requested)) {
       // Positioning modes activate immediately because they don't need NTP
-      // synchronization.
+      // synchronization. Any pending blocking state is superseded: the user
+      // explicitly chose a positioning mode, so waiting for a minute boundary
+      // or a stop-at-top would prevent it from ever starting.
       current_mode = requested;
       mode_change_pending = false;
-      waiting_for_minute = false;
+      stopped = false;
+      start_at_minute_pending = false;
+      stop_at_top_pending = false;
       logMessagef("Mode changed to: %s (immediate)", modeToString(requested));
       publishCurrentMode();
     } else if (stopped) {
       // No revolution to wait for, so apply the mode immediately and wait for
       // the next minute boundary to start synchronized.
       current_mode = requested;
+      if (isTimekeeping(current_mode)) last_timekeeping_mode = current_mode;
       mode_change_pending = false;
       start_at_minute_pending = true;
       logMessagef("Mode changed to: %s (starting at next minute boundary)",
@@ -361,7 +357,7 @@ static void onSaveConfig() {
   should_save_config = true;
 }
 
-// Called when the revolution completes (960 pulses done) to apply any pending
+// Called when the revolution completes (60 pulses done) to apply any pending
 // mode change before the idle gap.
 static void onRevolutionComplete() {
   if (stop_at_top_pending) {
@@ -374,6 +370,7 @@ static void onRevolutionComplete() {
   if (mode_change_pending) {
     TickMode old_mode = current_mode;
     current_mode = pending_mode;
+    if (isTimekeeping(current_mode)) last_timekeeping_mode = current_mode;
     mode_change_pending = false;
     logMessagef("Mode changed to: %s", modeToString(current_mode));
     publishCurrentMode();
@@ -391,10 +388,7 @@ static void onRevolutionComplete() {
 // Called at each minute boundary to reset state for the new minute.
 static void startNewMinute() {
   pulse_index = 0;
-  waiting_for_minute = false;
-  if (current_mode == TickMode::vetinari) {
-    shuffleVetinariCycles();
-  }
+  fillTickDurations();
 }
 
 // --- Arduino entrypoints ---
@@ -405,8 +399,8 @@ void setup() {
   pinMode(PIN_COIL_A, OUTPUT);
   pinMode(PIN_COIL_B, OUTPUT);
   setCoilIdle();
-  gpio_set_drive_capability((gpio_num_t)PIN_COIL_A, GPIO_DRIVE_CAP_2);
-  gpio_set_drive_capability((gpio_num_t)PIN_COIL_B, GPIO_DRIVE_CAP_2);
+  gpio_set_drive_capability((gpio_num_t)PIN_COIL_A, GPIO_DRIVE_CAP_0);
+  gpio_set_drive_capability((gpio_num_t)PIN_COIL_B, GPIO_DRIVE_CAP_0);
 
   delay(2000);
 
@@ -470,9 +464,11 @@ void setup() {
 }
 
 void loop() {
-  // Only attempt MQTT (re)connection during the idle gap between revolutions,
-  // so the blocking connect() call doesn't stall pulse timing.
-  if (!mqtt_client.connected() && (waiting_for_minute || stopped)) {
+  // Only attempt MQTT (re)connection when we're not actively pulsing, so the
+  // blocking connect() call doesn't stall pulse timing. For timekeeping modes,
+  // pulse_index == 59 is the idle wait at the minute boundary.
+  bool is_idle = stopped || (isTimekeeping(current_mode) && pulse_index == 59);
+  if (!mqtt_client.connected() && is_idle) {
     connectMqtt();
   }
   mqtt_client.loop();
@@ -484,8 +480,18 @@ void loop() {
     if (getMsIntoMinute() < 1000) {
       if (mode_change_pending) {
         current_mode = pending_mode;
+        if (isTimekeeping(current_mode)) last_timekeeping_mode = current_mode;
         mode_change_pending = false;
         logMessagef("Mode changed to: %s", modeToString(current_mode));
+        publishCurrentMode();
+      }
+      if (!isTimekeeping(current_mode)) {
+        // If the user was in a positioning mode when the minute boundary fires,
+        // fall back to the last timekeeping mode so the clock actually keeps
+        // time rather than running in an unsynchronized positioning mode.
+        current_mode = last_timekeeping_mode;
+        logMessagef("Falling back to last timekeeping mode: %s",
+                    modeToString(current_mode));
         publishCurrentMode();
       }
       stopped = false;
@@ -501,54 +507,36 @@ void loop() {
     return;
   }
 
-  if (waiting_for_minute) {
-    // All 960 pulses are done for this minute. Wait for the next minute
-    // boundary before starting again.
-    if (now - minute_start_ms >= 60000) {
-      minute_start_ms += 60000;
-      startNewMinute();
-    }
-    return;
-  }
-
-#if TICKING_MOVEMENT
-  // For ticking movements, timekeeping modes fire a burst of 16 pulses once
-  // per second (the hand jumps one second mark per tick).
   if (isTimekeeping(current_mode)) {
-    uint32_t elapsed = now - minute_start_ms;
-    uint32_t current_second = elapsed / 1000;
-    uint32_t expected_pulses = (current_second + 1) * 16;
-    if (expected_pulses > PULSES_PER_REVOLUTION) {
-      expected_pulses = PULSES_PER_REVOLUTION;
-    }
-
-    if (pulse_index < expected_pulses) {
-      // Fire all 16 pulses in a rapid burst.
-      while (pulse_index < expected_pulses) {
-        pulseOnce(PULSE_MS);
+    if (pulse_index < 59) {
+      // Duration must be captured before pulseOnce() increments pulse_index,
+      // otherwise we'd read one past the end of the array.
+      uint16_t duration = tick_durations[pulse_index];
+      pulseOnce();
+      delay(duration - PULSE_MS);
+    } else {
+      // Pulse 59: wait for the NTP minute boundary before firing, so the hand
+      // lands on 12 o'clock exactly on the minute.
+      if (now - minute_start_ms >= 60000) {
+        minute_start_ms += 60000;
+        pulseOnce();
+        onRevolutionComplete();
+        if (!stopped) {
+          startNewMinute();
+        }
       }
     }
   } else {
-    // Positioning modes use the same cycle-based timing as sweeping movements.
-    uint32_t cycle_ms = getCycleMs();
-    pulseOnce(PULSE_MS);
-    delay(cycle_ms - PULSE_MS);
-  }
-#else
-  uint32_t cycle_ms = getCycleMs();
-  // Crawl needs a short pulse with a long pause to move the hand slowly.
-  // All other modes split the cycle evenly between pulse and pause.
-  uint32_t pulse_ms =
-      current_mode == TickMode::crawl ? PULSE_MS : cycle_ms / 2;
-  pulseOnce(pulse_ms);
-  delay(cycle_ms - pulse_ms);
-#endif
-
-  if (pulse_index >= PULSES_PER_REVOLUTION) {
-    onRevolutionComplete();
-    if (isTimekeeping(current_mode)) {
-      waiting_for_minute = true;
+    // Positioning modes (sprint/crawl) run continuously without NTP sync.
+    if (current_mode == TickMode::sprint) {
+      pulseOnce();
+      delay(SPRINT_GAP_MS);
     } else {
+      pulseOnce();
+      delay(CRAWL_GAP_MS);
+    }
+    if (pulse_index >= PULSES_PER_REVOLUTION) {
+      onRevolutionComplete();
       pulse_index = 0;
     }
   }
