@@ -646,19 +646,27 @@ void loop() {
         minute_start_ms += 60000;
         pulseOnce();
 
-        struct timeval tv;
-        gettimeofday(&tv, nullptr);
-        struct tm timeinfo;
-        localtime_r(&tv.tv_sec, &timeinfo);
-        // t=0 because pulse 59 is the NTP-wait pulse with no tick_durations entry.
-        logMessagef("tick %u t=0 time=%02d:%02d:%02d.%02ld",
-                    pulse_index,
-                    timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_sec,
-                    tv.tv_usec / 10000);
-
         onRevolutionComplete();
         if (!stopped) {
           startNewMinute();
+          // The boundary pulse acts as tick 0 of the new minute. Consuming
+          // tick_durations[0] here ensures the gap between the boundary pulse
+          // and the next pulse equals tick_durations[0], matching every other
+          // inter-pulse gap. Without this, loop() would immediately fire tick 0
+          // with no delay, producing a visible double-tick.
+          uint16_t boundary_tick_duration = tick_durations[0];
+
+          struct timeval tv;
+          gettimeofday(&tv, nullptr);
+          struct tm timeinfo;
+          localtime_r(&tv.tv_sec, &timeinfo);
+          logMessagef("tick 0 t=%u time=%02d:%02d:%02d.%02ld",
+                      boundary_tick_duration,
+                      timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_sec,
+                      tv.tv_usec / 10000);
+
+          delay(boundary_tick_duration - PULSE_MS);
+          pulse_index = 1;
         }
       }
     }

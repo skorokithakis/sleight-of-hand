@@ -91,7 +91,7 @@ Both tables sum to the same ~58 s total as the other timekeeping modes, leaving 
 - All timekeeping modes produce exactly 60 pulses per minute, anchored to NTP
 - **Pulse 59 (the last pulse)** is special: the loop spins until `millis() - minute_start_ms >= 60000`, then fires the pulse and calls `onRevolutionComplete()` (`src/main.cpp` lines 590–597)
 - After `onRevolutionComplete()`, `minute_start_ms += 60000` (not re-read from NTP) to avoid drift from NTP query latency
-- `startNewMinute()` resets `pulse_index = 0` and refills `tick_durations` (`src/main.cpp` lines 459–462)
+- `startNewMinute()` resets `pulse_index = 0` and refills `tick_durations` (`src/main.cpp` lines 459–462); immediately after, the boundary pulse consumes `tick_durations[0]` as its post-pulse delay and `pulse_index` is advanced to 1, so the next `loop()` iteration picks up at tick 1
 - `getMsIntoMinute()` reads `gettimeofday()` and returns `tm_sec * 1000 + tv_usec / 1000` (`src/main.cpp` lines 242–248)
 - On boot, the firmware waits for `getMsIntoMinute() < 1000` (i.e. the first second of a new minute) before starting (`src/main.cpp` lines 530–573)
 - `start_at_minute_pending` flag drives this wait; it is set on boot and whenever switching from a positioning mode back to a timekeeping mode
@@ -99,7 +99,7 @@ Both tables sum to the same ~58 s total as the other timekeeping modes, leaving 
 ### Sprint and crawl (positioning modes)
 
 - Activate immediately when commanded, bypassing the revolution-boundary queue
-- Both modes accept an optional tick-duration parameter in milliseconds (e.g. `sprint 150`, `crawl 500`). The value is clamped to a minimum of 50 ms. Without a parameter, `SPRINT_DEFAULT_MS` (300) or `CRAWL_DEFAULT_MS` (2000) is used.
+- Both modes accept an optional tick-duration parameter in milliseconds (e.g. `sprint 150`, `crawl 500`). The value is clamped to a minimum of 100 ms. Without a parameter, `SPRINT_DEFAULT_MS` (300) or `CRAWL_DEFAULT_MS` (2000) is used.
 - Run continuously without NTP sync: `pulseOnce()` + `delay(positioning_tick_ms - PULSE_MS)`, wrapping `pulse_index` at `PULSES_PER_REVOLUTION` (`src/main.cpp` lines 599–609)
 - When switching back to a timekeeping mode, `onRevolutionComplete()` sets `stopped = true` and `start_at_minute_pending = true`, so the clock waits for the next NTP minute boundary before resuming (`src/main.cpp` lines 448–454)
 
@@ -107,7 +107,7 @@ Both tables sum to the same ~58 s total as the other timekeeping modes, leaving 
 
 `pulse_index` must **only** be reset by:
 1. The `start` MQTT command (`src/main.cpp` line 280)
-2. `startNewMinute()` at each minute boundary (`src/main.cpp` line 460)
+2. `startNewMinute()` at each minute boundary (`src/main.cpp` line 460), followed immediately by advancing `pulse_index` to 1 (the boundary pulse acts as tick 0)
 3. The positioning-mode wrap in `loop()` (`src/main.cpp` line 607) — this is the only other reset, and it is intentional for sprint/crawl which run without NTP sync
 4. The `calibrate <position>` MQTT command — sets `pulse_index` to the user-supplied position so the sprint loop counts the remaining pulses correctly and wraps at exactly p00. This is intentional: the user is asserting the physical hand position.
 
@@ -157,7 +157,7 @@ MQTT (re)connection is only attempted when `stopped` is true or `pulse_index == 
 - UDP logging only when WiFi is connected
 - Format: `(millis - IP): message`
 - Helpers: `logMessage()` and `logMessagef()` (`src/main.cpp` lines 104–127)
-- Per-tick status line logged after every pulse: `tick <pulse_index> t=<duration_ms> time=HH:MM:SS.cc` (pulse 59 logs `t=0` since it has no `tick_durations` entry — it waits for the NTP boundary instead)
+- Per-tick status line logged after every pulse: `tick <pulse_index> t=<duration_ms> time=HH:MM:SS.cc` (the boundary pulse logs `tick 0 t=<tick_durations[0]>` since it acts as tick 0 of the new minute)
 
 ### Configuration storage
 
@@ -181,16 +181,17 @@ No linting, formatting, or testing infrastructure. This is typical for embedded 
 
 ## Project structure hotspots
 
-- `src/main.cpp` (615 lines) — Full firmware: WiFi, NTP, MQTT, all tick modes, minute-boundary synchronization.
+- `src/main.cpp` (676 lines) — Full firmware: WiFi, NTP, MQTT, all tick modes, minute-boundary synchronization.
 - `platformio.ini` — Build configuration with one active environment (`vetinari`).
 - `README.md` — Comprehensive documentation of hardware, modes, MQTT API, and configuration constants.
 - `AGENTS.md` — Development constraints (especially the `pulse_index` reset rule) and documentation maintenance rules.
-- `misc/coding-team/` — Task spec documents for AI coding agents; not compiled. Six completed task series:
+- `misc/coding-team/` — Task spec documents for AI coding agents; not compiled. Seven completed task series:
   - `ticking-mode-refactor/` — Replaced 960-pulse/16-burst model with 60-pulse/gap model
   - `centralized-tick-table/` — Introduced `tick_durations[]` table and p00/t00 terminology
   - `sprint-crawl-immediate-start/` — Made positioning modes activate immediately and added `last_timekeeping_mode` fallback
   - `sprint-crawl-parameter/` — Added optional tick-duration parameter to sprint/crawl commands
   - `calibrate-command/` — Added `calibrate <position>` command for hand re-synchronization
+  - `hesitate-stumble-modes/` — Added hesitate and stumble tick modes
   - `pin-change-status-print-cleanup/` — Changed coil pins from 4/5 to 5/6, added per-tick status logging, removed `simple.cpp` and its build environment
 
 **Key boundaries**:
@@ -249,4 +250,6 @@ All delays are calculated from gap constants or `tick_durations[]`, not arbitrar
 
 ## Open questions
 
-1. **README pin numbers are stale**: `README.md` still documents `PIN_COIL_A = 4` and `PIN_COIL_B = 5`, but the source was changed to 5 and 6 by the `pin-change-status-print-cleanup` task. The README hardware wiring diagram needs updating to reflect GPIO 5 and 6.
+1. **README pin numbers are stale**: `README.md` still documents `PIN_COIL_A = 4` and `PIN_COIL_B = 5` in both the hardware wiring diagram (lines 21–23) and the configuration table (lines 152–153), but the source was changed to 5 and 6 by the `pin-change-status-print-cleanup` task. The README hardware wiring diagram and configuration table need updating to reflect GPIO 5 and 6.
+
+2. **README sprint/crawl minimum parameter is stale**: `README.md` line 103 documents the minimum tick-duration parameter as 50 ms (`# Sprint and crawl accept an optional tick duration in milliseconds (minimum 50 ms).`), but `src/main.cpp` lines 387 and 392 clamp to 100 ms. The README comment needs updating to 100 ms.
