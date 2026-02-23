@@ -98,13 +98,13 @@ bool start_at_minute_pending = false;
 // (at pulse 60, i.e. the hand is at 12 o'clock).
 bool stop_at_top_pending = false;
 
-// The millis() timestamp of the current minute boundary. All pulse scheduling
-// is relative to this, so timing stays locked to NTP regardless of loop jitter.
-uint32_t minute_start_ms = 0;
-
-// Debug instrumentation for minute-boundary waiting while pulse_index == 59.
-bool boundary_wait_logged = false;
-uint32_t boundary_wait_started_ms = 0;
+// Set when a calibrate sprint is active. Calibrate sprints set pulse_index to
+// position + 1 (one ahead of the actual hand position), so the early-stop
+// check at pulse_index == PULSES_PER_REVOLUTION - 1 would fire one pulse too
+// early (leaving the hand at p58 instead of p59). When this flag is set, the
+// early-stop check is skipped and the existing pulse_index >= PULSES_PER_REVOLUTION
+// wrap handles the revolution end correctly (hand lands at p59).
+bool is_calibrate_sprint = false;
 
 // --- Logging ---
 
@@ -118,7 +118,7 @@ static void logMessage(const char* message) {
   WiFiUDP udp;
   IPAddress broadcast_ip(255, 255, 255, 255);
   String packet = "(" + String(millis()) + " - " +
-                  WiFi.localIP().toString() + "): " + message;
+                  WiFi.localIP().toString() + "): " + message + "\r\n";
   udp.beginPacket(broadcast_ip, UDP_LOG_PORT);
   udp.write((const uint8_t*)packet.c_str(), packet.length());
   udp.endPacket();
@@ -213,6 +213,23 @@ static void pulseOnce(uint32_t pulse_ms = PULSE_MS) {
   pulse_index++;
 }
 
+// Returns false and sets stopped=true if the sum of tick_durations exceeds
+// 59800 ms, which would cause the 59 ticks to overflow into the next minute
+// before the NTP boundary pulse fires.
+static bool validateTickDurationsSum() {
+  uint32_t sum = 0;
+  for (uint8_t i = 0; i < TICK_COUNT; i++) {
+    sum += tick_durations[i];
+  }
+  if (sum > 59800) {
+    logMessagef("tick_durations sum %lu exceeds 59800 for mode %s, stopping.",
+                (unsigned long)sum, modeToString(current_mode));
+    stopped = true;
+    return false;
+  }
+  return true;
+}
+
 static void fillTickDurations() {
   switch (current_mode) {
     case TickMode::steady:
@@ -265,6 +282,7 @@ static void fillTickDurations() {
       // Positioning modes (sprint/crawl) don't use the tick_durations table.
       break;
   }
+  validateTickDurationsSum();
 }
 
 // --- NTP ---
@@ -322,7 +340,7 @@ static void onMqttMessage(char* topic, byte* payload, unsigned int length) {
     stopped = false;
     start_at_minute_pending = false;
     pulse_index = 0;
-    minute_start_ms = millis();
+    is_calibrate_sprint = false;
     logMessage("Clock started immediately.");
     return;
   }
@@ -352,19 +370,20 @@ static void onMqttMessage(char* topic, byte* payload, unsigned int length) {
       logMessagef("Unknown command: %s", buffer);
       return;
     }
-    if (position == 0) {
-      // Already at p00: stop and wait for the next minute boundary to re-sync.
-      // No sprint needed because the hand is already in position.
+    if (position == 59) {
+      // Already at p59, which is the desired pre-boundary calibrate position.
       stopped = true;
       start_at_minute_pending = true;
       stop_at_top_pending = false;
       mode_change_pending = false;
-      logMessage("Calibrate: at p00, waiting for minute boundary.");
+      is_calibrate_sprint = false;
+      logMessage("Calibrate: at p59, waiting for minute boundary.");
     } else {
-      // Set pulse_index to the known position so the sprint loop counts the
-      // remaining pulses correctly and wraps at exactly p00. This is one of
+      // Set pulse_index to one step past the known position so the sprint loop
+      // sends exactly enough pulses to land on p59 (not p00) before waiting
+      // for the minute boundary tick to move to p00. This is one of
       // the four sanctioned pulse_index reset points (see ARCHITECTURE.md).
-      pulse_index = (uint16_t)position;
+      pulse_index = (uint16_t)(position + 1);
 
       // Parse an optional delay_ms after the position. We store delay_ms +
       // PULSE_MS because the sprint loop does delay(positioning_tick_ms -
@@ -385,11 +404,12 @@ static void onMqttMessage(char* topic, byte* payload, unsigned int length) {
       stop_at_top_pending = false;
       pending_mode = last_timekeeping_mode;
       mode_change_pending = true;
+      is_calibrate_sprint = true;
       if (has_custom_delay) {
-        logMessagef("Calibrate: sprinting from p%02u to p00 at %ums delay, then resuming %s.",
+        logMessagef("Calibrate: sprinting from p%02u to p59 at %ums delay, then resuming %s.",
                     position, delay_ms, modeToString(last_timekeeping_mode));
       } else {
-        logMessagef("Calibrate: sprinting from p%02u to p00, then resuming %s.",
+        logMessagef("Calibrate: sprinting from p%02u to p59, then resuming %s.",
                     position, modeToString(last_timekeeping_mode));
       }
       publishCurrentMode();
@@ -417,6 +437,7 @@ static void onMqttMessage(char* topic, byte* payload, unsigned int length) {
   if (has_parameterized_mode) {
     current_mode = parameterized_mode;
     mode_change_pending = false;
+    is_calibrate_sprint = false;
     stopped = false;
     start_at_minute_pending = false;
     stop_at_top_pending = false;
@@ -438,6 +459,7 @@ static void onMqttMessage(char* topic, byte* payload, unsigned int length) {
                                 : CRAWL_DEFAULT_MS;
       current_mode = requested;
       mode_change_pending = false;
+      is_calibrate_sprint = false;
       stopped = false;
       start_at_minute_pending = false;
       stop_at_top_pending = false;
@@ -497,6 +519,8 @@ static void onSaveConfig() {
 // Called when the revolution completes (60 pulses done) to apply any pending
 // mode change before the idle gap.
 static void onRevolutionComplete() {
+  is_calibrate_sprint = false;
+
   if (stop_at_top_pending) {
     stop_at_top_pending = false;
     stopped = true;
@@ -594,26 +618,38 @@ void setup() {
 
   randomSeed(esp_random());
 
-  // Wait for the next minute boundary before starting, so the hand (assumed
-  // to be at 12 o'clock) begins exactly on the minute.
+  // Wait for the next minute boundary before starting. The hand is assumed to
+  // be at p59; start_at_minute_pending will fire the p59→p00 boundary pulse
+  // and then begin the first full minute.
   stopped = true;
   start_at_minute_pending = true;
 }
 
 void loop() {
-  // Only attempt MQTT (re)connection when we're not actively pulsing, so the
-  // blocking connect() call doesn't stall pulse timing. For timekeeping modes,
-  // pulse_index == 59 is the idle wait at the minute boundary.
-  bool is_idle = stopped || (isTimekeeping(current_mode) && pulse_index == 59);
-  if (!mqtt_client.connected() && is_idle) {
+  // Check the minute boundary first, before any potentially-blocking MQTT
+  // work. This ensures the boundary pulse fires as soon as the NTP second
+  // rolls over, regardless of MQTT state.
+  if (isTimekeeping(current_mode) && pulse_index == 59 && !stopped) {
+    if (getMsIntoMinute() < 500) {
+      pulseOnce();
+      onRevolutionComplete();
+      if (!stopped) {
+        startNewMinute();
+      }
+      return;
+    }
+  }
+
+  // Only attempt MQTT (re)connection when stopped. Attempting reconnection
+  // while timekeeping risks connectMqtt() blocking through the p59 boundary
+  // window, causing a missed pulse. mqtt_client.loop() still runs every
+  // iteration so message handling is unaffected.
+  if (!mqtt_client.connected() && stopped) {
     connectMqtt();
   }
   mqtt_client.loop();
 
-  uint32_t now = millis();
-
   if (start_at_minute_pending) {
-    boundary_wait_logged = false;
     // Poll NTP until the second rolls over to 0, then start.
     if (getMsIntoMinute() < 1000) {
       if (mode_change_pending) {
@@ -634,25 +670,29 @@ void loop() {
       }
       stopped = false;
       start_at_minute_pending = false;
-      minute_start_ms = millis();
-      startNewMinute();
+      // Fire the p59→p00 boundary pulse before starting the new minute.
+      // The hand is always at p59 when this path runs: on boot the hand is
+      // assumed to be at p59, and calibrate/positioning modes sprint to p59
+      // before setting start_at_minute_pending.
+      pulseOnce();
+      startNewMinute(); // pulse_index = 0, fill tick_durations
       logMessage("Minute boundary reached, clock started.");
     }
     return;
   }
 
   if (stopped) {
-    boundary_wait_logged = false;
     return;
   }
 
   if (isTimekeeping(current_mode)) {
     if (pulse_index < 59) {
-      boundary_wait_logged = false;
-      // Capture the tick index before pulseOnce() increments pulse_index,
-      // so the log reports the tick that actually fired.
+      uint16_t duration = tick_durations[pulse_index];
+      // Delay first so that the pulse fires at the scheduled wall-clock time,
+      // then log the tick that fired. pulse_index is captured after the delay
+      // but before pulseOnce() increments it, so the log is still accurate.
+      delay(duration - PULSE_MS);
       uint8_t tick_index = pulse_index;
-      uint16_t duration = tick_durations[tick_index];
       pulseOnce();
 
       struct timeval tv;
@@ -663,54 +703,33 @@ void loop() {
                   tick_index, duration,
                   timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_sec,
                   tv.tv_usec / 10000);
-
-      delay(duration - PULSE_MS);
-    } else {
-      // Pulse 59: wait for the NTP minute boundary before firing, so the hand
-      // lands on 12 o'clock exactly on the minute.
-      uint32_t elapsed_ms = now - minute_start_ms;
-      if (!boundary_wait_logged) {
-        boundary_wait_logged = true;
-        boundary_wait_started_ms = now;
-        uint32_t remaining_ms = (elapsed_ms >= 60000) ? 0 : (60000 - elapsed_ms);
-        logMessagef("boundary wait started: elapsed=%lums remaining=%lums",
-                    (unsigned long)elapsed_ms,
-                    (unsigned long)remaining_ms);
-      }
-
-      if (elapsed_ms >= 60000) {
-        logMessagef("boundary wait finished: waited=%lums elapsed=%lums",
-                    (unsigned long)(now - boundary_wait_started_ms),
-                    (unsigned long)elapsed_ms);
-        minute_start_ms += 60000;
-        pulseOnce();
-
-        onRevolutionComplete();
-        if (!stopped) {
-          startNewMinute();
-          // After the boundary pulse (tick 59), consume tick_durations[0] as
-          // the delay to the first in-minute pulse (tick 0). Keeping
-          // pulse_index at 0 ensures the next loop iteration fires tick 0.
-          uint16_t boundary_tick_duration = tick_durations[0];
-
-          struct timeval tv;
-          gettimeofday(&tv, nullptr);
-          struct tm timeinfo;
-          localtime_r(&tv.tv_sec, &timeinfo);
-          logMessagef("tick 59 t=%u time=%02d:%02d:%02d.%02ld",
-                      boundary_tick_duration,
-                      timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_sec,
-                      tv.tv_usec / 10000);
-
-          delay(boundary_tick_duration - PULSE_MS);
-        }
-      }
     }
+    // pulse_index == 59: the boundary check at the top of loop() handles this
+    // case; nothing to do here.
   } else {
-    boundary_wait_logged = false;
     // Positioning modes (sprint/crawl) run continuously without NTP sync.
     // Both modes share the same structure; only the tick duration differs,
     // and that is already stored in positioning_tick_ms.
+
+    // When the hand is one pulse away from completing a revolution AND a
+    // timekeeping mode change is pending, skip the final pulse (p59→p00) so
+    // the hand stops at p59. start_at_minute_pending will then fire the
+    // p59→p00 boundary pulse at the correct NTP moment. Without this check,
+    // the revolution would complete to p00, violating the invariant that the
+    // hand is always at p59 when start_at_minute_pending fires.
+    //
+    // Calibrate sprints are excluded: they set pulse_index = position + 1
+    // (one ahead of the actual hand position), so this check would fire one
+    // pulse too early (hand at p58 instead of p59). The existing
+    // pulse_index >= PULSES_PER_REVOLUTION wrap handles calibrate sprints
+    // correctly (the sprint fires exactly enough pulses to land at p59).
+    if (!is_calibrate_sprint && !stop_at_top_pending &&
+        pulse_index == PULSES_PER_REVOLUTION - 1 &&
+        mode_change_pending && isTimekeeping(pending_mode)) {
+      onRevolutionComplete();
+      return;
+    }
+
     pulseOnce();
     delay(positioning_tick_ms - PULSE_MS);
     if (pulse_index >= PULSES_PER_REVOLUTION) {
