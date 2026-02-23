@@ -662,17 +662,17 @@ void loop() {
       // lands on 12 o'clock exactly on the minute.
       if (now - minute_start_ms >= 60000) {
         minute_start_ms += 60000;
-        pulseOnce();
 
         onRevolutionComplete();
         if (!stopped) {
           startNewMinute();
-          // The boundary pulse acts as tick 0 of the new minute. Consuming
-          // tick_durations[0] here ensures the gap between the boundary pulse
-          // and the next pulse equals tick_durations[0], matching every other
-          // inter-pulse gap. Without this, loop() would immediately fire tick 0
-          // with no delay, producing a visible double-tick.
+          // Capture tick_durations[0] before pulseOnce() increments pulse_index
+          // from 0 to 1, for the same reason as the normal-tick path above.
           uint16_t boundary_tick_duration = tick_durations[0];
+          // The boundary pulse fires after startNewMinute() so it naturally
+          // becomes tick 0 of the new minute. pulseOnce() increments
+          // pulse_index from 0 to 1, so no manual assignment is needed.
+          pulseOnce();
 
           struct timeval tv;
           gettimeofday(&tv, nullptr);
@@ -684,7 +684,6 @@ void loop() {
                       tv.tv_usec / 10000);
 
           delay(boundary_tick_duration - PULSE_MS);
-          pulse_index = 1;
         }
       }
     }
