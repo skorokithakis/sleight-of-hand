@@ -125,7 +125,7 @@ Control commands (handled first, before mode parsing):
 | `start` | Sets `stopped = false`, resets `pulse_index = 0`, sets `minute_start_ms = millis()` |
 | `start_at_minute` | Sets `start_at_minute_pending = true`, clears `stop_at_top_pending` |
 | `stop_at_top` | Sets `stop_at_top_pending = true`, clears `start_at_minute_pending` |
-| `calibrate <position>` | Sets `pulse_index` to the given position (0–59), then sprints to p00 and queues a return to `last_timekeeping_mode`. Position 0 skips sprint and waits for the minute boundary directly. Position ≥ 60 is rejected. |
+| `calibrate <position> [delay_ms]` | Sets `pulse_index` to the given position (0–59), then sprints to p00 and queues a return to `last_timekeeping_mode`. Position 0 skips sprint and waits for the minute boundary directly. Position ≥ 60 is rejected. Optional `delay_ms` sets the raw inter-pulse delay during the sprint; when omitted, `CALIBRATE_SPRINT_MS` (200 ms) is used. |
 
 Mode commands (parsed by `stringToMode()` for bare names, or by prefix matching for parameterized forms):
 

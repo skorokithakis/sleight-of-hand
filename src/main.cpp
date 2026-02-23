@@ -361,15 +361,33 @@ static void onMqttMessage(char* topic, byte* payload, unsigned int length) {
       // remaining pulses correctly and wraps at exactly p00. This is one of
       // the four sanctioned pulse_index reset points (see ARCHITECTURE.md).
       pulse_index = (uint16_t)position;
-      positioning_tick_ms = CALIBRATE_SPRINT_MS;
+
+      // Parse an optional delay_ms after the position. We store delay_ms +
+      // PULSE_MS because the sprint loop does delay(positioning_tick_ms -
+      // PULSE_MS), so adding PULSE_MS here cancels out and delivers the exact
+      // raw inter-pulse delay the user requested.
+      uint32_t delay_ms = 0;
+      bool has_custom_delay = false;
+      if (*endptr == ' ') {
+        char* delay_endptr;
+        delay_ms = (uint32_t)strtoul(endptr + 1, &delay_endptr, 10);
+        has_custom_delay = (delay_endptr != endptr + 1);
+      }
+      positioning_tick_ms = has_custom_delay ? delay_ms + PULSE_MS : CALIBRATE_SPRINT_MS;
+
       current_mode = TickMode::sprint;
       stopped = false;
       start_at_minute_pending = false;
       stop_at_top_pending = false;
       pending_mode = last_timekeeping_mode;
       mode_change_pending = true;
-      logMessagef("Calibrate: sprinting from p%02u to p00, then resuming %s.",
-                  position, modeToString(last_timekeeping_mode));
+      if (has_custom_delay) {
+        logMessagef("Calibrate: sprinting from p%02u to p00 at %ums delay, then resuming %s.",
+                    position, delay_ms, modeToString(last_timekeeping_mode));
+      } else {
+        logMessagef("Calibrate: sprinting from p%02u to p00, then resuming %s.",
+                    position, modeToString(last_timekeeping_mode));
+      }
       publishCurrentMode();
     }
     return;
