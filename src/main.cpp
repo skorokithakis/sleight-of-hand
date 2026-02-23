@@ -102,6 +102,10 @@ bool stop_at_top_pending = false;
 // is relative to this, so timing stays locked to NTP regardless of loop jitter.
 uint32_t minute_start_ms = 0;
 
+// Debug instrumentation for minute-boundary waiting while pulse_index == 59.
+bool boundary_wait_logged = false;
+uint32_t boundary_wait_started_ms = 0;
+
 // --- Logging ---
 
 static void logMessage(const char* message) {
@@ -609,6 +613,7 @@ void loop() {
   uint32_t now = millis();
 
   if (start_at_minute_pending) {
+    boundary_wait_logged = false;
     // Poll NTP until the second rolls over to 0, then start.
     if (getMsIntoMinute() < 1000) {
       if (mode_change_pending) {
@@ -637,14 +642,17 @@ void loop() {
   }
 
   if (stopped) {
+    boundary_wait_logged = false;
     return;
   }
 
   if (isTimekeeping(current_mode)) {
     if (pulse_index < 59) {
-      // Duration must be captured before pulseOnce() increments pulse_index,
-      // otherwise we'd read one past the end of the array.
-      uint16_t duration = tick_durations[pulse_index];
+      boundary_wait_logged = false;
+      // Capture the tick index before pulseOnce() increments pulse_index,
+      // so the log reports the tick that actually fired.
+      uint8_t tick_index = pulse_index;
+      uint16_t duration = tick_durations[tick_index];
       pulseOnce();
 
       struct timeval tv;
@@ -652,7 +660,7 @@ void loop() {
       struct tm timeinfo;
       localtime_r(&tv.tv_sec, &timeinfo);
       logMessagef("tick %u t=%u time=%02d:%02d:%02d.%02ld",
-                  pulse_index, duration,
+                  tick_index, duration,
                   timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_sec,
                   tv.tv_usec / 10000);
 
@@ -660,25 +668,36 @@ void loop() {
     } else {
       // Pulse 59: wait for the NTP minute boundary before firing, so the hand
       // lands on 12 o'clock exactly on the minute.
-      if (now - minute_start_ms >= 60000) {
+      uint32_t elapsed_ms = now - minute_start_ms;
+      if (!boundary_wait_logged) {
+        boundary_wait_logged = true;
+        boundary_wait_started_ms = now;
+        uint32_t remaining_ms = (elapsed_ms >= 60000) ? 0 : (60000 - elapsed_ms);
+        logMessagef("boundary wait started: elapsed=%lums remaining=%lums",
+                    (unsigned long)elapsed_ms,
+                    (unsigned long)remaining_ms);
+      }
+
+      if (elapsed_ms >= 60000) {
+        logMessagef("boundary wait finished: waited=%lums elapsed=%lums",
+                    (unsigned long)(now - boundary_wait_started_ms),
+                    (unsigned long)elapsed_ms);
         minute_start_ms += 60000;
+        pulseOnce();
 
         onRevolutionComplete();
         if (!stopped) {
           startNewMinute();
-          // Capture tick_durations[0] before pulseOnce() increments pulse_index
-          // from 0 to 1, for the same reason as the normal-tick path above.
+          // After the boundary pulse (tick 59), consume tick_durations[0] as
+          // the delay to the first in-minute pulse (tick 0). Keeping
+          // pulse_index at 0 ensures the next loop iteration fires tick 0.
           uint16_t boundary_tick_duration = tick_durations[0];
-          // The boundary pulse fires after startNewMinute() so it naturally
-          // becomes tick 0 of the new minute. pulseOnce() increments
-          // pulse_index from 0 to 1, so no manual assignment is needed.
-          pulseOnce();
 
           struct timeval tv;
           gettimeofday(&tv, nullptr);
           struct tm timeinfo;
           localtime_r(&tv.tv_sec, &timeinfo);
-          logMessagef("tick 0 t=%u time=%02d:%02d:%02d.%02ld",
+          logMessagef("tick 59 t=%u time=%02d:%02d:%02d.%02ld",
                       boundary_tick_duration,
                       timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_sec,
                       tv.tv_usec / 10000);
@@ -688,6 +707,7 @@ void loop() {
       }
     }
   } else {
+    boundary_wait_logged = false;
     // Positioning modes (sprint/crawl) run continuously without NTP sync.
     // Both modes share the same structure; only the tick duration differs,
     // and that is already stored in positioning_tick_ms.
