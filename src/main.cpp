@@ -133,6 +133,16 @@ static void logMessagef(const char* format, ...) {
   logMessage(buffer);
 }
 
+static void logBoundaryPulse() {
+  struct timeval tv;
+  gettimeofday(&tv, nullptr);
+  struct tm timeinfo;
+  localtime_r(&tv.tv_sec, &timeinfo);
+  logMessagef("boundary time=%02d:%02d:%02d.%02ld",
+              timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_sec,
+              tv.tv_usec / 10000);
+}
+
 // --- Mode name helpers ---
 
 static const char* modeToString(TickMode mode) {
@@ -632,6 +642,7 @@ void loop() {
   if (isTimekeeping(current_mode) && pulse_index == 59 && !stopped) {
     if (getMsIntoMinute() < 500) {
       pulseOnce();
+      logBoundaryPulse();
       onRevolutionComplete();
       if (!stopped) {
         startNewMinute();
@@ -675,6 +686,7 @@ void loop() {
       // assumed to be at p59, and calibrate/positioning modes sprint to p59
       // before setting start_at_minute_pending.
       pulseOnce();
+      logBoundaryPulse();
       startNewMinute(); // pulse_index = 0, fill tick_durations
       logMessage("Minute boundary reached, clock started.");
     }
