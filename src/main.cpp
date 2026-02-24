@@ -17,7 +17,7 @@ constexpr uint32_t PULSE_MS = 31;
 constexpr uint32_t SPRINT_DEFAULT_MS = 300;
 constexpr uint32_t CRAWL_DEFAULT_MS = 2000;
 constexpr uint32_t CALIBRATE_SPRINT_MS = 200;
-constexpr uint16_t RUSH_WAIT_DEFAULT_MS = 932;
+constexpr uint16_t RUSH_WAIT_DEFAULT_MS = 700;
 
 constexpr uint8_t TICK_COUNT = 59;
 
