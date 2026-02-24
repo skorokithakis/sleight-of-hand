@@ -30,14 +30,37 @@ For movements that need more current than the ESP32 can source directly, use a
 small H-bridge (e.g. DRV8833) between the GPIO pins and the coil.
 
 
-## Building
+## Building and flashing
 
 Requires [PlatformIO](https://platformio.org/).
 
 ```sh
-# Full firmware (WiFi, NTP, MQTT, tick modes)
+# Build
 pio run -e vetinari
+```
+
+### Flashing over USB
+
+```sh
 pio run -e vetinari -t upload
+```
+
+The first flash after changing the partition table must be done over USB.
+
+### Flashing over WiFi (OTA)
+
+Once the firmware is running and connected to WiFi, subsequent flashes can be
+done over the air:
+
+```sh
+pio run -e vetinari-ota -t upload
+```
+
+This uses mDNS to find the device at `sleight-of-hand.local`. You can also
+flash by IP address directly:
+
+```sh
+pio run -e vetinari -t upload --upload-port <ip>
 ```
 
 

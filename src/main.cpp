@@ -1,4 +1,5 @@
 #include <Arduino.h>
+#include <ArduinoOTA.h>
 #include <Preferences.h>
 #include <PubSubClient.h>
 #include <WiFi.h>
@@ -570,8 +571,8 @@ void setup() {
   pinMode(PIN_COIL_A, OUTPUT);
   pinMode(PIN_COIL_B, OUTPUT);
   setCoilIdle();
-  gpio_set_drive_capability((gpio_num_t)PIN_COIL_A, GPIO_DRIVE_CAP_0);
-  gpio_set_drive_capability((gpio_num_t)PIN_COIL_B, GPIO_DRIVE_CAP_0);
+  gpio_set_drive_capability((gpio_num_t)PIN_COIL_A, GPIO_DRIVE_CAP_1);
+  gpio_set_drive_capability((gpio_num_t)PIN_COIL_B, GPIO_DRIVE_CAP_1);
 
   delay(2000);
 
@@ -612,6 +613,9 @@ void setup() {
     logMessagef("Saved MQTT config: %s:%d", mqtt_host, mqtt_port);
   }
 
+  ArduinoOTA.setHostname("sleight-of-hand");
+  ArduinoOTA.begin();
+
   // NTP sync.
   configTime(UTC_OFFSET_SECONDS, 0, NTP_SERVER);
   logMessage("Waiting for NTP sync...");
@@ -636,6 +640,8 @@ void setup() {
 }
 
 void loop() {
+  ArduinoOTA.handle();
+
   // Check the minute boundary first, before any potentially-blocking MQTT
   // work. This ensures the boundary pulse fires as soon as the NTP second
   // rolls over, regardless of MQTT state.
