@@ -17,6 +17,7 @@ constexpr uint32_t PULSE_MS = 31;
 constexpr uint32_t SPRINT_DEFAULT_MS = 300;
 constexpr uint32_t CRAWL_DEFAULT_MS = 2000;
 constexpr uint32_t CALIBRATE_SPRINT_MS = 200;
+constexpr uint16_t RUSH_WAIT_DEFAULT_MS = 932;
 
 constexpr uint8_t TICK_COUNT = 59;
 
@@ -81,6 +82,10 @@ TickMode last_timekeeping_mode = TickMode::vetinari;
 
 // Set on every sprint/crawl activation; no default needed.
 uint32_t positioning_tick_ms = 0;
+
+// Per-tick duration for rush_wait mode. Adjusted via "rush_wait <ms>" MQTT
+// command; bare "rush_wait" resets it to the default.
+uint16_t rush_wait_tick_ms = RUSH_WAIT_DEFAULT_MS;
 
 // --- State ---
 
@@ -251,7 +256,7 @@ static void fillTickDurations() {
     case TickMode::rush_wait:
       // 59 pulses in ~55 s leaves ~5 s of idle before the NTP boundary.
       for (uint8_t i = 0; i < TICK_COUNT; i++) {
-        tick_durations[i] = 932;
+        tick_durations[i] = rush_wait_tick_ms;
       }
       break;
     case TickMode::vetinari:
@@ -443,6 +448,26 @@ static void onMqttMessage(char* topic, byte* payload, unsigned int length) {
     has_parameterized_mode = true;
     uint32_t requested_ms = (uint32_t)strtoul(buffer + 6, nullptr, 10);
     positioning_tick_ms = requested_ms < 100 ? 100 : requested_ms;
+  } else if (strncmp(buffer, "rush_wait ", 10) == 0) {
+    // rush_wait is a timekeeping mode, so it must queue at revolution
+    // boundaries rather than activate immediately like sprint/crawl.
+    uint32_t requested_ms = (uint32_t)strtoul(buffer + 10, nullptr, 10);
+    rush_wait_tick_ms = (uint16_t)(requested_ms < 200 ? 200 : requested_ms);
+    if (stopped) {
+      current_mode = TickMode::rush_wait;
+      last_timekeeping_mode = TickMode::rush_wait;
+      mode_change_pending = false;
+      start_at_minute_pending = true;
+      logMessagef("Mode changed to: rush_wait (starting at next minute boundary, tick=%ums)",
+                  rush_wait_tick_ms);
+      publishCurrentMode();
+    } else {
+      pending_mode = TickMode::rush_wait;
+      mode_change_pending = true;
+      logMessagef("Mode change queued: rush_wait (applies at next revolution, tick=%ums)",
+                  rush_wait_tick_ms);
+    }
+    return;
   }
 
   if (has_parameterized_mode) {
@@ -480,6 +505,10 @@ static void onMqttMessage(char* topic, byte* payload, unsigned int length) {
     } else if (stopped) {
       // No revolution to wait for, so apply the mode immediately and wait for
       // the next minute boundary to start synchronized.
+      if (requested == TickMode::rush_wait) {
+        // Bare "rush_wait" always reverts to the default tick duration.
+        rush_wait_tick_ms = RUSH_WAIT_DEFAULT_MS;
+      }
       current_mode = requested;
       if (isTimekeeping(current_mode)) last_timekeeping_mode = current_mode;
       mode_change_pending = false;
@@ -488,6 +517,10 @@ static void onMqttMessage(char* topic, byte* payload, unsigned int length) {
                    modeToString(requested));
       publishCurrentMode();
     } else {
+      if (requested == TickMode::rush_wait) {
+        // Bare "rush_wait" always reverts to the default tick duration.
+        rush_wait_tick_ms = RUSH_WAIT_DEFAULT_MS;
+      }
       pending_mode = requested;
       mode_change_pending = true;
       logMessagef("Mode change queued: %s (applies at next revolution)",

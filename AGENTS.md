@@ -33,6 +33,6 @@ If at least one of the above is true, save the information here, in the "Saved
 information" section.
 
 
-## Saved information
+## MUST-DO rules
 
-- When finishing a feature, always `jj describe` it.
+- When finishing a feature, always, ALWAYS `jj describe` it. Do not forget this, ever.
