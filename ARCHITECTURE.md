@@ -55,7 +55,7 @@ Timekeeping modes use `tick_durations[]` (total wall-clock duration per tick, in
 
 `isTimekeeping()` (`src/main.cpp` line 190) returns true for steady/rush_wait/vetinari/hesitate/stumble and false for sprint/crawl.
 
-Default mode on boot: `vetinari`.
+Default mode on boot: random (selected by `selectRandomTimekeepingMode()` in `setup()`).
 
 ### Tick duration table
 
@@ -114,6 +114,17 @@ Both tables sum to the same ~58 s total as the other timekeeping modes, leaving 
 4. The `calibrate <position>` MQTT command — for positions 0–58, sets `pulse_index` to `position + 1` so the sprint loop sends exactly the remaining pulses to land on p59 before re-sync. Position 59 skips sprint and waits directly. This is intentional: the user is asserting the physical hand position.
 
 It must never be reset elsewhere. This is a hard constraint from `AGENTS.md`.
+
+### Hourly random mode rotation
+
+On every boot and at every top-of-hour minute boundary, `selectRandomTimekeepingMode()` picks a random entry from `TIMEKEEPING_MODES[]` and sets `current_mode` and `last_timekeeping_mode` to it. If the chosen mode is `rush_wait`, `rush_wait_tick_ms` is reset to `RUSH_WAIT_DEFAULT_MS`. The selection is logged and published via MQTT.
+
+- `TIMEKEEPING_MODES[]` (`src/main.cpp`) — `constexpr` array of all five timekeeping `TickMode` values; the single source of truth for the random picker.
+- `TIMEKEEPING_MODE_COUNT` — derived from `sizeof(TIMEKEEPING_MODES)` so it stays in sync automatically.
+- On boot: called in `setup()` after `randomSeed()`, before `stopped = true; start_at_minute_pending = true`.
+- Hourly: called inside `startNewMinute()` when `tm_min == 0`, before `fillTickDurations()`, so the new mode's tick table is filled without a redundant fill of the old mode.
+- Manual MQTT mode changes still work as before; the next hour boundary overrides them.
+- `pulse_index` is never touched by this feature.
 
 ### MQTT command handling
 
@@ -199,6 +210,7 @@ No linting, formatting, or testing infrastructure. This is typical for embedded 
   - `boundary-double-tick-fix/` — Fixed double-tick at minute boundary by consuming `tick_durations[0]` inline and advancing `pulse_index` to 1; also added optional `delay_ms` parameter to `calibrate` command
   - `boundary-pulse-count-fix/` — Tracked and corrected minute-boundary off-by-one regressions while iterating on pulse ownership and logging
   - `minute-loop-cleanup/` — Unified the minute loop: delay-first tick body, NTP-only boundary detection via `getMsIntoMinute()`, eliminated `minute_start_ms`, added `tick_durations` sum validation
+  - `hourly-random-mode/` — Added random timekeeping mode selection on boot and at every top-of-hour boundary
 
 **Key boundaries**:
 - `src/` — all application code; single source file with no shared headers
@@ -249,8 +261,4 @@ All delays are calculated from gap constants or `tick_durations[]`, not arbitrar
 - Evidence: `src/main.cpp` lines 694, 733
 
 
-## Open questions
 
-1. **README pin numbers are stale**: `README.md` still documents `PIN_COIL_A = 4` and `PIN_COIL_B = 5` in both the hardware wiring diagram (lines 21–23) and the configuration table (lines 152–153), but the source was changed to 5 and 6 by the `pin-change-status-print-cleanup` task. The README hardware wiring diagram and configuration table need updating to reflect GPIO 5 and 6.
-
-2. **README sprint/crawl minimum parameter is stale**: `README.md` line 103 documents the minimum tick-duration parameter as 50 ms (`# Sprint and crawl accept an optional tick duration in milliseconds (minimum 50 ms).`), but `src/main.cpp` lines 429 and 434 clamp to 100 ms. The README comment needs updating to 100 ms.

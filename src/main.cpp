@@ -75,9 +75,22 @@ TickMode current_mode = TickMode::vetinari;
 TickMode pending_mode = TickMode::vetinari;
 bool mode_change_pending = false;
 
+// All timekeeping modes in one place. Used by selectRandomTimekeepingMode() so
+// that adding a new timekeeping mode only requires updating this array and the
+// enum — the random picker stays correct automatically.
+constexpr TickMode TIMEKEEPING_MODES[] = {
+  TickMode::steady,
+  TickMode::rush_wait,
+  TickMode::vetinari,
+  TickMode::hesitate,
+  TickMode::stumble,
+};
+constexpr uint8_t TIMEKEEPING_MODE_COUNT =
+    sizeof(TIMEKEEPING_MODES) / sizeof(TIMEKEEPING_MODES[0]);
+
 // Tracks the last timekeeping mode that was active, so that start_at_minute
 // can fall back to it if current_mode is a positioning mode when the minute
-// boundary fires. Vetinari is the default because it's the power-on mode.
+// boundary fires. Overwritten immediately on boot by selectRandomTimekeepingMode().
 TickMode last_timekeeping_mode = TickMode::vetinari;
 
 // Set on every sprint/crawl activation; no default needed.
@@ -333,6 +346,23 @@ static void publishCurrentMode() {
     mqtt_client.publish(MQTT_TOPIC_MODE_STATE, modeToString(current_mode),
                         true);
   }
+}
+
+// Picks a random timekeeping mode, applies it to current_mode and
+// last_timekeeping_mode, resets rush_wait_tick_ms if needed, logs the
+// selection, and publishes via MQTT. Does not touch pulse_index.
+static void selectRandomTimekeepingMode() {
+  uint8_t index = (uint8_t)(esp_random() % TIMEKEEPING_MODE_COUNT);
+  TickMode chosen = TIMEKEEPING_MODES[index];
+  current_mode = chosen;
+  last_timekeeping_mode = chosen;
+  if (chosen == TickMode::rush_wait) {
+    // Mirror what the bare "rush_wait" MQTT command does: reset to the default
+    // tick duration so the randomly-selected mode behaves predictably.
+    rush_wait_tick_ms = RUSH_WAIT_DEFAULT_MS;
+  }
+  logMessagef("Random mode selected: %s", modeToString(chosen));
+  publishCurrentMode();
 }
 
 static void onMqttMessage(char* topic, byte* payload, unsigned int length) {
@@ -593,6 +623,20 @@ static void onRevolutionComplete() {
 // Called at each minute boundary to reset state for the new minute.
 static void startNewMinute() {
   pulse_index = 0;
+
+  // At the top of every hour, pick a new random timekeeping mode before
+  // filling the tick table. This means the new mode is in effect for the
+  // entire new minute, with no wasted fill of the old mode's table.
+  // Manual MQTT mode changes still work — they just get overridden at the
+  // next hour boundary.
+  struct timeval tv;
+  gettimeofday(&tv, nullptr);
+  struct tm timeinfo;
+  localtime_r(&tv.tv_sec, &timeinfo);
+  if (timeinfo.tm_min == 0) {
+    selectRandomTimekeepingMode();
+  }
+
   fillTickDurations();
 }
 
@@ -664,6 +708,12 @@ void setup() {
   mqtt_client.setCallback(onMqttMessage);
 
   randomSeed(esp_random());
+
+  // Pick the initial timekeeping mode randomly so every boot starts with a
+  // different feel. This runs before MQTT connects, so the published state
+  // will be overwritten once MQTT connects and publishCurrentMode() is called
+  // again from connectMqtt(). That's fine — the mode is already set correctly.
+  selectRandomTimekeepingMode();
 
   // Wait for the next minute boundary before starting. The hand is assumed to
   // be at p59; start_at_minute_pending will fire the p59→p00 boundary pulse

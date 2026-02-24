@@ -14,12 +14,12 @@ to NTP minute boundaries, so the clock stays accurate regardless of mode.
 
 - ESP32-C3 (Super Mini or similar)
 - Sweeping quartz clock movement with the original driver board removed
-- Coil driven directly from GPIO 4 and GPIO 5 with a series resistor (820 ohm
+- Coil driven directly from GPIO 5 and GPIO 6 with a series resistor (820 ohm
   on one lead for a 600 ohm coil at 3.3V)
 
 ```
-GPIO 4 --[820R]--> Coil lead A
-GPIO 5 ------------> Coil lead B
+GPIO 5 --[820R]--> Coil lead A
+GPIO 6 ------------> Coil lead B
 ```
 
 The firmware drives the Lavet motor with alternating polarity 31 ms pulses,
@@ -104,7 +104,7 @@ Sprint and crawl are positioning modes, not timekeeping modes. When switching
 from either back to a timed mode, the clock waits for the next NTP minute
 boundary to re-sync.
 
-The default mode is `vetinari`.
+On every boot and at every top-of-hour minute boundary, the clock picks a random timekeeping mode. Manual MQTT mode changes still work as before; the next hour boundary overrides them.
 
 
 ## MQTT
@@ -123,7 +123,7 @@ mosquitto_pub -h <broker> -t clock/mode/set -m "stumble"
 mosquitto_pub -h <broker> -t clock/mode/set -m "sprint"
 mosquitto_pub -h <broker> -t clock/mode/set -m "crawl"
 
-# Sprint and crawl accept an optional tick duration in milliseconds (minimum 50 ms).
+# Sprint and crawl accept an optional tick duration in milliseconds (minimum 100 ms).
 # Without a parameter the defaults (300 ms and 2000 ms) are used.
 mosquitto_pub -h <broker> -t clock/mode/set -m "sprint 150"
 mosquitto_pub -h <broker> -t clock/mode/set -m "crawl 500"
@@ -172,8 +172,8 @@ Constants at the top of `src/main.cpp`:
 
 | Constant | Default | Description |
 |---|---|---|
-| `PIN_COIL_A` | 4 | GPIO pin for coil lead A |
-| `PIN_COIL_B` | 5 | GPIO pin for coil lead B |
+| `PIN_COIL_A` | 5 | GPIO pin for coil lead A |
+| `PIN_COIL_B` | 6 | GPIO pin for coil lead B |
 | `PULSE_MS` | 31 | Coil pulse duration in ms |
 | `PULSES_PER_REVOLUTION` | 60 | Ticks per full revolution of the second hand |
 | `TICK_COUNT` | 59 | Number of ticks governed by the tick duration table per minute |
