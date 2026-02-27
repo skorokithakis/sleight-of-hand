@@ -789,21 +789,8 @@ void loop() {
   if (isTimekeeping(current_mode)) {
     if (pulse_index < 59) {
       uint16_t duration = tick_durations[pulse_index];
-      // Delay first so that the pulse fires at the scheduled wall-clock time,
-      // then log the tick that fired. pulse_index is captured after the delay
-      // but before pulseOnce() increments it, so the log is still accurate.
       delay(duration - PULSE_MS);
-      uint8_t tick_index = pulse_index;
       pulseOnce();
-
-      struct timeval tv;
-      gettimeofday(&tv, nullptr);
-      struct tm timeinfo;
-      localtime_r(&tv.tv_sec, &timeinfo);
-      logMessagef("tick %u t=%u time=%02d:%02d:%02d.%02ld",
-                  tick_index, duration,
-                  timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_sec,
-                  tv.tv_usec / 10000);
     }
     // pulse_index == 59: the boundary check at the top of loop() handles this
     // case; nothing to do here.
