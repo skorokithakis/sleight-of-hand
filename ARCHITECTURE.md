@@ -21,8 +21,9 @@
 
 ### Build environments
 
-One active build target defined in `platformio.ini`:
-- `vetinari`: Full firmware with WiFi, NTP, MQTT, and all tick modes.
+Two active build targets defined in `platformio.ini`:
+- `sleight`: Full firmware with WiFi, NTP, MQTT, and all tick modes.
+- `sleight-ota`: Same as `sleight` but uploads via OTA to `sleight-of-hand.local`.
 
 ### Pulse model
 
@@ -50,10 +51,11 @@ Timekeeping modes use `tick_durations[]` (total wall-clock duration per tick, in
 | `vetinari` | Timekeeping | Yes | At next revolution boundary |
 | `hesitate` | Timekeeping | Yes | At next revolution boundary |
 | `stumble` | Timekeeping | Yes | At next revolution boundary |
+| `gravity` | Timekeeping | Yes | At next revolution boundary |
 | `sprint` | Positioning | No | Immediately |
 | `crawl` | Positioning | No | Immediately |
 
-`isTimekeeping()` (`src/main.cpp` line 190) returns true for steady/rush_wait/vetinari/hesitate/stumble and false for sprint/crawl.
+`isTimekeeping()` (`src/main.cpp` line 190) returns true for steady/rush_wait/vetinari/hesitate/stumble/gravity and false for sprint/crawl.
 
 Default mode on boot: random (selected by `selectRandomTimekeepingMode()` in `setup()`).
 
@@ -66,6 +68,7 @@ Default mode on boot: random (selected by `selectRandomTimekeepingMode()` in `se
 - `vetinari`: Fisher-Yates shuffle of `VETINARI_TEMPLATE` (534–2001 ms, sorted ascending in the template)
 - `hesitate`: 58 entries of 980 ms and 1 entry of 2000 ms, Fisher-Yates shuffled each minute
 - `stumble`: 58 entries of 1010 ms and 1 entry of 420 ms, Fisher-Yates shuffled each minute
+- `gravity`: indices 0–29 = 500 ms, indices 30–58 = 1520 ms; not shuffled (positional mapping is the point)
 - Positioning modes: table is not used
 
 ### Vetinari mode
@@ -86,6 +89,15 @@ Both modes follow the same structure as vetinari — 59 programmatically generat
 **Stumble**: 58 entries of 1010 ms and 1 entry of 420 ms. The single short tick lands at a random position each minute, causing the hand to jump forward quickly as if stumbling.
 
 Both tables sum to the same ~58 s total as the other timekeeping modes, leaving the remainder as idle time before the NTP-anchored 60th pulse.
+
+### Gravity mode
+
+Gravity mode simulates gravitational acceleration: the hand moves fast on the falling side of the dial (12→6) and slow on the rising side (6→12).
+
+- Indices 0–29 (12 o'clock to 6 o'clock, falling): 500 ms each
+- Indices 30–58 (6 o'clock to 12 o'clock, rising): 1520 ms each
+- No shuffle — the positional mapping is the whole point; the speed difference must align with the physical dial position.
+- Total: 30 × 500 + 29 × 1520 = 59,080 ms, leaving ~920 ms idle before the NTP-anchored 60th pulse.
 
 ### Timing and minute synchronization
 
@@ -119,7 +131,7 @@ It must never be reset elsewhere. This is a hard constraint from `AGENTS.md`.
 
 On every boot and at every top-of-hour minute boundary, `selectRandomTimekeepingMode()` picks a random entry from `TIMEKEEPING_MODES[]` and sets `current_mode` and `last_timekeeping_mode` to it. If the chosen mode is `rush_wait`, `rush_wait_tick_ms` is reset to `RUSH_WAIT_DEFAULT_MS`. The selection is logged and published via MQTT.
 
-- `TIMEKEEPING_MODES[]` (`src/main.cpp`) — `constexpr` array of all five timekeeping `TickMode` values; the single source of truth for the random picker.
+- `TIMEKEEPING_MODES[]` (`src/main.cpp`) — `constexpr` array of all six timekeeping `TickMode` values; the single source of truth for the random picker.
 - `TIMEKEEPING_MODE_COUNT` — derived from `sizeof(TIMEKEEPING_MODES)` so it stays in sync automatically.
 - On boot: called in `setup()` after `randomSeed()`, before `stopped = true; start_at_minute_pending = true`.
 - Hourly: called inside `startNewMinute()` when `tm_min == 0`, before `fillTickDurations()`, so the new mode's tick table is filled without a redundant fill of the old mode.
@@ -185,8 +197,9 @@ MQTT (re)connection is only attempted when `stopped` is true. Attempting reconne
 No linting, formatting, or testing infrastructure. This is typical for embedded Arduino projects.
 
 **Build commands** (from `platformio.ini` and PlatformIO conventions):
-- `pio run -e vetinari` — build full firmware
-- `pio run -e vetinari -t upload` — upload to device
+- `pio run -e sleight` — build full firmware
+- `pio run -e sleight -t upload` — upload to device via USB
+- `pio run -e sleight-ota -t upload` — upload to device via OTA
 
 **Monitoring**:
 - Serial: `pio device monitor`
@@ -196,7 +209,7 @@ No linting, formatting, or testing infrastructure. This is typical for embedded 
 ## Project structure hotspots
 
 - `src/main.cpp` (740 lines) — Full firmware: WiFi, NTP, MQTT, all tick modes, minute-boundary synchronization.
-- `platformio.ini` — Build configuration with one active environment (`vetinari`).
+- `platformio.ini` — Build configuration with two active environments (`sleight`, `sleight-ota`).
 - `README.md` — Comprehensive documentation of hardware, modes, MQTT API, and configuration constants.
 - `AGENTS.md` — Development constraints (especially the `pulse_index` reset rule) and documentation maintenance rules.
 - `misc/coding-team/` — Task spec documents for AI coding agents; not compiled. Eight completed task series:
@@ -211,6 +224,7 @@ No linting, formatting, or testing infrastructure. This is typical for embedded 
   - `boundary-pulse-count-fix/` — Tracked and corrected minute-boundary off-by-one regressions while iterating on pulse ownership and logging
   - `minute-loop-cleanup/` — Unified the minute loop: delay-first tick body, NTP-only boundary detection via `getMsIntoMinute()`, eliminated `minute_start_ms`, added `tick_durations` sum validation
   - `hourly-random-mode/` — Added random timekeeping mode selection on boot and at every top-of-hour boundary
+  - `gravity-mode/` — Added gravity timekeeping mode (fast 12→6, slow 6→12)
 
 **Key boundaries**:
 - `src/` — all application code; single source file with no shared headers

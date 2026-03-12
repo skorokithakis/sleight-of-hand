@@ -36,13 +36,13 @@ Requires [PlatformIO](https://platformio.org/).
 
 ```sh
 # Build
-pio run -e vetinari
+pio run -e sleight
 ```
 
 ### Flashing over USB
 
 ```sh
-pio run -e vetinari -t upload
+pio run -e sleight -t upload
 ```
 
 The first flash after changing the partition table must be done over USB.
@@ -53,20 +53,20 @@ Once the firmware is running and connected to WiFi, subsequent flashes can be
 done over the air:
 
 ```sh
-pio run -e vetinari-ota -t upload
+pio run -e sleight-ota -t upload
 ```
 
 This uses mDNS to find the device at `sleight-of-hand.local`. You can also
 flash by IP address directly:
 
 ```sh
-pio run -e vetinari -t upload --upload-port <ip>
+pio run -e sleight -t upload --upload-port <ip>
 ```
 
 
 ## First boot
 
-1. Flash the `vetinari` environment.
+1. Flash the `sleight` environment.
 2. The ESP32 creates a WiFi access point called **SleightOfHand**.
 3. Connect to it and configure your WiFi credentials, MQTT broker host, and
    MQTT broker port through the captive portal.

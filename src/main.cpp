@@ -67,6 +67,7 @@ enum class TickMode : uint8_t {
   vetinari,
   hesitate,
   stumble,
+  gravity,
   sprint,
   crawl,
 };
@@ -84,6 +85,7 @@ constexpr TickMode TIMEKEEPING_MODES[] = {
   TickMode::vetinari,
   TickMode::hesitate,
   TickMode::stumble,
+  TickMode::gravity,
 };
 constexpr uint8_t TIMEKEEPING_MODE_COUNT =
     sizeof(TIMEKEEPING_MODES) / sizeof(TIMEKEEPING_MODES[0]);
@@ -176,6 +178,8 @@ static const char* modeToString(TickMode mode) {
       return "hesitate";
     case TickMode::stumble:
       return "stumble";
+    case TickMode::gravity:
+      return "gravity";
     case TickMode::sprint:
       return "sprint";
     case TickMode::crawl:
@@ -203,6 +207,10 @@ static bool stringToMode(const char* str, TickMode& out) {
   }
   if (strcmp(str, "stumble") == 0) {
     out = TickMode::stumble;
+    return true;
+  }
+  if (strcmp(str, "gravity") == 0) {
+    out = TickMode::gravity;
     return true;
   }
   if (strcmp(str, "sprint") == 0) {
@@ -305,6 +313,19 @@ static void fillTickDurations() {
         uint16_t temporary = tick_durations[i];
         tick_durations[i] = tick_durations[j];
         tick_durations[j] = temporary;
+      }
+      break;
+    case TickMode::gravity:
+      // Indices 0-29 (12→6, falling): 500ms each — fast, like a hand
+      // accelerating under gravity. Indices 30-58 (6→12, rising): 1520ms each
+      // — slow, like a hand climbing against gravity. No shuffle: the
+      // positional mapping is the whole point. Total: 30*500 + 29*1520 =
+      // 59080ms.
+      for (uint8_t i = 0; i < 30; i++) {
+        tick_durations[i] = 500;
+      }
+      for (uint8_t i = 30; i < TICK_COUNT; i++) {
+        tick_durations[i] = 1520;
       }
       break;
     default:
