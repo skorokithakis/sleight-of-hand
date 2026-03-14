@@ -6,6 +6,7 @@
 #include <WiFiManager.h>
 #include <WiFiUdp.h>
 #include <driver/gpio.h>
+#include <math.h>
 #include <time.h>
 
 constexpr int PIN_COIL_A = 5;
@@ -315,19 +316,28 @@ static void fillTickDurations() {
         tick_durations[j] = temporary;
       }
       break;
-    case TickMode::gravity:
-      // Indices 0-29 (12→6, falling): 500ms each — fast, like a hand
-      // accelerating under gravity. Indices 30-58 (6→12, rising): 1520ms each
-      // — slow, like a hand climbing against gravity. No shuffle: the
-      // positional mapping is the whole point. Total: 30*500 + 29*1520 =
-      // 59080ms.
-      for (uint8_t i = 0; i < 30; i++) {
-        tick_durations[i] = 500;
+    case TickMode::gravity: {
+      // Pendulum physics: angular velocity at angle θ from the top is
+      // proportional to sqrt(1 + k - cos(θ)), so tick duration is the
+      // inverse. The energy excess k prevents the singularity at the top
+      // (where a pendulum with exactly the minimum energy would take infinite
+      // time). k=0.05 gives a ~6.3x ratio between the slowest tick (at 12,
+      // ~3150ms) and the fastest (at 6, ~500ms).
+      constexpr float ENERGY_EXCESS = 0.05f;
+      constexpr float BUDGET_MS = 59000.0f;
+      float raw_times[TICK_COUNT];
+      float raw_sum = 0;
+      for (uint8_t i = 0; i < TICK_COUNT; i++) {
+        float theta = 2.0f * M_PI * (i + 0.5f) / 60.0f;
+        raw_times[i] = 1.0f / sqrtf(1.0f + ENERGY_EXCESS - cosf(theta));
+        raw_sum += raw_times[i];
       }
-      for (uint8_t i = 30; i < TICK_COUNT; i++) {
-        tick_durations[i] = 1520;
+      float scale = BUDGET_MS / raw_sum;
+      for (uint8_t i = 0; i < TICK_COUNT; i++) {
+        tick_durations[i] = (uint16_t)(raw_times[i] * scale + 0.5f);
       }
       break;
+    }
     default:
       // Positioning modes (sprint/crawl) don't use the tick_durations table.
       break;
