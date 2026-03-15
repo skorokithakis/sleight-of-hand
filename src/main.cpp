@@ -679,8 +679,8 @@ void setup() {
   pinMode(PIN_COIL_A, OUTPUT);
   pinMode(PIN_COIL_B, OUTPUT);
   setCoilIdle();
-  gpio_set_drive_capability((gpio_num_t)PIN_COIL_A, GPIO_DRIVE_CAP_1);
-  gpio_set_drive_capability((gpio_num_t)PIN_COIL_B, GPIO_DRIVE_CAP_1);
+  gpio_set_drive_capability((gpio_num_t)PIN_COIL_A, GPIO_DRIVE_CAP_0);
+  gpio_set_drive_capability((gpio_num_t)PIN_COIL_B, GPIO_DRIVE_CAP_0);
 
   delay(2000);
 
