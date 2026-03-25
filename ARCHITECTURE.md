@@ -36,9 +36,9 @@ The firmware drives a Lavet motor with alternating-polarity 31 ms pulses, one pe
   - `SPRINT_DEFAULT_MS` = 300 ms total tick (used when no parameter is given)
   - `CRAWL_DEFAULT_MS` = 2000 ms total tick (used when no parameter is given)
   - `CALIBRATE_SPRINT_MS` = 200 ms total tick (fixed speed used during `calibrate` sprints; not user-configurable)
-  - `RUSH_WAIT_DEFAULT_MS` = 932 ms total tick (default for `rush_wait` mode; used when bare `rush_wait` is commanded)
+  - `RUSH_WAIT_DEFAULT_MS` = 700 ms total tick (default for `rush_wait` mode; used when bare `rush_wait` is commanded)
 - `positioning_tick_ms` (`src/main.cpp` line 84): runtime variable holding the active tick duration for the current positioning mode; set on every sprint/crawl activation
-- `rush_wait_tick_ms` (`src/main.cpp` line 88): runtime variable holding the active tick duration for `rush_wait` mode; defaults to `RUSH_WAIT_DEFAULT_MS`, configurable via `rush_wait <ms>` MQTT command
+- `rush_wait_tick_ms` (`src/main.cpp` line 104): runtime variable holding the active tick duration for `rush_wait` mode; defaults to `RUSH_WAIT_DEFAULT_MS`, configurable via `rush_wait <ms>` MQTT command
 
 Timekeeping modes use `tick_durations[]` (total wall-clock duration per tick, including the pulse). The gap after the pulse is `tick_durations[pulse_index] - PULSE_MS`.
 
@@ -64,7 +64,7 @@ Default mode on boot: random (selected by `selectRandomTimekeepingMode()` in `se
 `tick_durations[TICK_COUNT]` is a 59-element array of `uint16_t` total wall-clock durations (ms). Filled by `fillTickDurations()` at the start of each minute:
 
 - `steady`: all 59 entries = 1000 ms
-- `rush_wait`: all 59 entries = `rush_wait_tick_ms` (default 932 ms, configurable via `rush_wait <ms>` command; ~55 s total at default, ~5 s idle before minute boundary)
+- `rush_wait`: all 59 entries = `rush_wait_tick_ms` (default 700 ms, configurable via `rush_wait <ms>` command; ~41 s total at default, ~19 s idle before minute boundary)
 - `vetinari`: Fisher-Yates shuffle of `VETINARI_TEMPLATE` (534–2001 ms, sorted ascending in the template)
 - `hesitate`: 58 entries of 980 ms and 1 entry of 2000 ms, Fisher-Yates shuffled each minute
 - `stumble`: 58 entries of 1010 ms and 1 entry of 420 ms, Fisher-Yates shuffled each minute

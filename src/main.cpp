@@ -48,7 +48,8 @@ constexpr long UTC_OFFSET_SECONDS = 0;
 constexpr char MQTT_TOPIC_MODE_SET[] = "clock/mode/set";
 constexpr char MQTT_TOPIC_MODE_STATE[] = "clock/mode/state";
 constexpr uint16_t MQTT_DEFAULT_PORT = 1883;
-constexpr uint32_t MQTT_RECONNECT_INTERVAL_MS = 5000;
+constexpr uint32_t MQTT_RECONNECT_INTERVAL_STOPPED_MS = 5000;
+constexpr uint32_t MQTT_RECONNECT_INTERVAL_RUNNING_MS = 60000;
 
 constexpr uint16_t UDP_LOG_PORT = 37243;
 
@@ -598,10 +599,23 @@ static void connectMqtt() {
   }
 
   uint32_t now = millis();
-  if (now - last_mqtt_reconnect_attempt_ms < MQTT_RECONNECT_INTERVAL_MS) {
+  uint32_t interval = stopped ? MQTT_RECONNECT_INTERVAL_STOPPED_MS : MQTT_RECONNECT_INTERVAL_RUNNING_MS;
+  if (now - last_mqtt_reconnect_attempt_ms < interval) {
     return;
   }
   last_mqtt_reconnect_attempt_ms = now;
+
+  // Probe the broker with a throwaway TCP connection before calling
+  // mqtt_client.connect(). If the broker is unreachable, connect() would block
+  // for up to MQTT_SOCKET_TIMEOUT seconds, which could cause a missed boundary
+  // pulse. The probe uses a 100ms timeout so it fails fast when the broker is
+  // down, making it safe to attempt reconnection while the clock is running.
+  WiFiClient probe_client;
+  if (!probe_client.connect(mqtt_host, mqtt_port, 100)) {
+    logMessagef("MQTT probe failed, broker unreachable at %s:%d", mqtt_host, mqtt_port);
+    return;
+  }
+  probe_client.stop();
 
   logMessagef("Connecting to MQTT %s:%d...", mqtt_host, mqtt_port);
   if (mqtt_client.connect("sleight-of-hand")) {
@@ -735,6 +749,11 @@ void setup() {
   }
 
   // MQTT setup.
+  // 500ms backstop on the underlying TCP socket so that if the probe succeeds
+  // but the CONNACK is slow, the handshake still times out well within the
+  // ~940ms gap between the boundary check and the next tick. MQTT_SOCKET_TIMEOUT
+  // (set via build_flags) caps the PubSubClient read loop to 2s as a second layer.
+  wifi_client.setTimeout(500);
   mqtt_client.setServer(mqtt_host, mqtt_port);
   mqtt_client.setCallback(onMqttMessage);
 
@@ -771,11 +790,11 @@ void loop() {
     }
   }
 
-  // Only attempt MQTT (re)connection when stopped. Attempting reconnection
-  // while timekeeping risks connectMqtt() blocking through the p59 boundary
-  // window, causing a missed pulse. mqtt_client.loop() still runs every
-  // iteration so message handling is unaffected.
-  if (!mqtt_client.connected() && stopped) {
+  // Attempt MQTT (re)connection regardless of clock state. connectMqtt() opens
+  // a 100ms TCP probe first; if the broker is unreachable it returns immediately
+  // without blocking, so the p59 boundary window is safe. The 60s reconnect
+  // interval keeps probe overhead negligible.
+  if (!mqtt_client.connected()) {
     connectMqtt();
   }
   mqtt_client.loop();
