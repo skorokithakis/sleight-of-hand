@@ -50,6 +50,7 @@ constexpr char MQTT_TOPIC_MODE_STATE[] = "clock/mode/state";
 constexpr uint16_t MQTT_DEFAULT_PORT = 1883;
 constexpr uint32_t MQTT_RECONNECT_INTERVAL_STOPPED_MS = 5000;
 constexpr uint32_t MQTT_RECONNECT_INTERVAL_RUNNING_MS = 60000;
+constexpr uint32_t WIFI_RECONNECT_INTERVAL_MS = 30000;
 
 constexpr uint16_t UDP_LOG_PORT = 37243;
 
@@ -60,6 +61,7 @@ WiFiClient wifi_client;
 PubSubClient mqtt_client(wifi_client);
 Preferences preferences;
 uint32_t last_mqtt_reconnect_attempt_ms = 0;
+uint32_t last_wifi_reconnect_attempt_ms = 0;
 
 // --- Mode selection ---
 
@@ -593,6 +595,21 @@ static void onMqttMessage(char* topic, byte* payload, unsigned int length) {
   }
 }
 
+static void reconnectWifi() {
+  uint32_t now = millis();
+  if (now - last_wifi_reconnect_attempt_ms < WIFI_RECONNECT_INTERVAL_MS) {
+    return;
+  }
+  last_wifi_reconnect_attempt_ms = now;
+
+  // disconnect() + begin() (with no arguments) is more reliable than
+  // WiFi.reconnect() on ESP32 because it fully tears down the association
+  // before re-reading saved credentials from NVS and reconnecting.
+  logMessage("WiFi disconnected, attempting reconnect.");
+  WiFi.disconnect();
+  WiFi.begin();
+}
+
 static void connectMqtt() {
   if (strlen(mqtt_host) == 0) {
     return;
@@ -790,14 +807,18 @@ void loop() {
     }
   }
 
-  // Attempt MQTT (re)connection regardless of clock state. connectMqtt() opens
-  // a 100ms TCP probe first; if the broker is unreachable it returns immediately
-  // without blocking, so the p59 boundary window is safe. The 60s reconnect
-  // interval keeps probe overhead negligible.
-  if (!mqtt_client.connected()) {
-    connectMqtt();
+  if (WiFi.status() == WL_CONNECTED) {
+    // Attempt MQTT (re)connection regardless of clock state. connectMqtt() opens
+    // a 100ms TCP probe first; if the broker is unreachable it returns immediately
+    // without blocking, so the p59 boundary window is safe. The 60s reconnect
+    // interval keeps probe overhead negligible.
+    if (!mqtt_client.connected()) {
+      connectMqtt();
+    }
+    mqtt_client.loop();
+  } else {
+    reconnectWifi();
   }
-  mqtt_client.loop();
 
   if (start_at_minute_pending) {
     // Poll NTP until the second rolls over to 0, then start.
