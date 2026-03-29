@@ -37,8 +37,8 @@ The firmware drives a Lavet motor with alternating-polarity 31 ms pulses, one pe
   - `CRAWL_DEFAULT_MS` = 2000 ms total tick (used when no parameter is given)
   - `CALIBRATE_SPRINT_MS` = 200 ms total tick (fixed speed used during `calibrate` sprints; not user-configurable)
   - `RUSH_WAIT_DEFAULT_MS` = 700 ms total tick (default for `rush_wait` mode; used when bare `rush_wait` is commanded)
-- `positioning_tick_ms` (`src/main.cpp` line 84): runtime variable holding the active tick duration for the current positioning mode; set on every sprint/crawl activation
-- `rush_wait_tick_ms` (`src/main.cpp` line 104): runtime variable holding the active tick duration for `rush_wait` mode; defaults to `RUSH_WAIT_DEFAULT_MS`, configurable via `rush_wait <ms>` MQTT command
+- `positioning_tick_ms` (`src/main.cpp` line 103): runtime variable holding the active tick duration for the current positioning mode; set on every sprint/crawl activation
+- `rush_wait_tick_ms` (`src/main.cpp` line 107): runtime variable holding the active tick duration for `rush_wait` mode; defaults to `RUSH_WAIT_DEFAULT_MS`, configurable via `rush_wait <ms>` MQTT command
 
 Timekeeping modes use `tick_durations[]` (total wall-clock duration per tick, including the pulse). The gap after the pulse is `tick_durations[pulse_index] - PULSE_MS`.
 
@@ -55,7 +55,7 @@ Timekeeping modes use `tick_durations[]` (total wall-clock duration per tick, in
 | `sprint` | Positioning | No | Immediately |
 | `crawl` | Positioning | No | Immediately |
 
-`isTimekeeping()` (`src/main.cpp` line 190) returns true for steady/rush_wait/vetinari/hesitate/stumble/gravity and false for sprint/crawl.
+`isTimekeeping()` (`src/main.cpp` line 231) returns true for steady/rush_wait/vetinari/hesitate/stumble/gravity and false for sprint/crawl.
 
 Default mode on boot: random (selected by `selectRandomTimekeepingMode()` in `setup()`).
 
@@ -64,11 +64,11 @@ Default mode on boot: random (selected by `selectRandomTimekeepingMode()` in `se
 `tick_durations[TICK_COUNT]` is a 59-element array of `uint16_t` total wall-clock durations (ms). Filled by `fillTickDurations()` at the start of each minute:
 
 - `steady`: all 59 entries = 1000 ms
-- `rush_wait`: all 59 entries = `rush_wait_tick_ms` (default 700 ms, configurable via `rush_wait <ms>` command; ~41 s total at default, ~19 s idle before minute boundary)
+- `rush_wait`: all 59 entries = `rush_wait_tick_ms` (default 700 ms, configurable via `rush_wait <ms>` command; 59 × 700 = 41,300 ms total at default, ~18,700 ms idle before minute boundary)
 - `vetinari`: Fisher-Yates shuffle of `VETINARI_TEMPLATE` (534–2001 ms, sorted ascending in the template)
 - `hesitate`: 58 entries of 980 ms and 1 entry of 2000 ms, Fisher-Yates shuffled each minute
 - `stumble`: 58 entries of 1010 ms and 1 entry of 420 ms, Fisher-Yates shuffled each minute
-- `gravity`: indices 0–29 = 500 ms, indices 30–58 = 1520 ms; not shuffled (positional mapping is the point)
+- `gravity`: 59 entries computed from pendulum physics (`1/sqrt(1 + 0.05 - cos(θ))`), scaled to sum to 59,000 ms; not shuffled (positional mapping is the point)
 - Positioning modes: table is not used
 
 ### Vetinari mode
@@ -76,7 +76,7 @@ Default mode on boot: random (selected by `selectRandomTimekeepingMode()` in `se
 59 pulses with shuffled irregular durations, plus a 60th pulse fired exactly at the NTP minute boundary.
 
 - Template: 59 sorted `uint16_t` total-duration values (534–2001 ms) in `VETINARI_TEMPLATE` (`src/main.cpp` lines 25–32)
-- Shuffled each minute via Fisher-Yates into `tick_durations[]` (`src/main.cpp` lines 248–253)
+- Shuffled each minute via Fisher-Yates into `tick_durations[]` (`src/main.cpp` lines 288–294)
 - `getGapMs()` does not exist; the gap is computed inline as `tick_durations[pulse_index] - PULSE_MS`
 - Index 59 (the 60th pulse) never reads `tick_durations` — it waits for the NTP boundary instead
 
@@ -92,21 +92,22 @@ Both tables sum to the same ~58 s total as the other timekeeping modes, leaving 
 
 ### Gravity mode
 
-Gravity mode simulates gravitational acceleration: the hand moves fast on the falling side of the dial (12→6) and slow on the rising side (6→12).
+Gravity mode simulates a clock hand driven by pendulum physics: the hand moves fast near 6 o'clock (maximum kinetic energy) and slow near 12 o'clock (minimum kinetic energy).
 
-- Indices 0–29 (12 o'clock to 6 o'clock, falling): 500 ms each
-- Indices 30–58 (6 o'clock to 12 o'clock, rising): 1520 ms each
+- Each tick duration is computed from `1 / sqrt(1 + ENERGY_EXCESS - cos(θ))`, where `θ` is the angular position of the tick centre (in radians, measured from 12 o'clock). The raw values are scaled so their sum equals `BUDGET_MS` (59,000 ms).
+- `ENERGY_EXCESS = 0.05` prevents the singularity at 12 o'clock (where a pendulum with exactly the minimum energy would take infinite time) and produces a ~6.3× ratio between the slowest tick (near 12, ~3150 ms) and the fastest (near 6, ~500 ms).
 - No shuffle — the positional mapping is the whole point; the speed difference must align with the physical dial position.
-- Total: 30 × 500 + 29 × 1520 = 59,080 ms, leaving ~920 ms idle before the NTP-anchored 60th pulse.
+- Total budget: 59,000 ms, leaving ~1,000 ms idle before the NTP-anchored 60th pulse.
+- Evidence: `src/main.cpp` lines 322–343 (`fillTickDurations()` gravity case)
 
 ### Timing and minute synchronization
 
 - All timekeeping modes produce exactly 60 pulses per minute, anchored to NTP
   - **Ticks 0–58** use a delay-first loop body: `delay(tick_durations[pulse_index] - PULSE_MS)` then `pulseOnce()`. The delay fires first so the pulse lands at the scheduled wall-clock time.
   - **Pulse 59 (the boundary pulse)** is special: the loop spins until `getMsIntoMinute() < 500`, then fires `pulseOnce()`, calls `onRevolutionComplete()`, and starts the next minute via `startNewMinute()`. No `tick_durations` entry is consumed for the boundary pulse.
-  - `startNewMinute()` resets `pulse_index = 0` and refills `tick_durations` (`src/main.cpp` lines 550–553). After `startNewMinute()`, `loop()` returns immediately; on the next call `pulse_index = 0` and the uniform delay→pulse body handles tick 0 like all others.
-- `getMsIntoMinute()` reads `gettimeofday()` and returns `tm_sec * 1000 + tv_usec / 1000` (`src/main.cpp` lines 305–311). This is the single boundary-detection mechanism used everywhere.
-- On boot, the firmware waits for `getMsIntoMinute() < 1000` (i.e. the first second of a new minute) before starting (`src/main.cpp` lines 652–681)
+  - `startNewMinute()` resets `pulse_index = 0` and refills `tick_durations` (`src/main.cpp` lines 686–703). After `startNewMinute()`, `loop()` returns immediately; on the next call `pulse_index = 0` and the uniform delay→pulse body handles tick 0 like all others.
+- `getMsIntoMinute()` reads `gettimeofday()` and returns `tm_sec * 1000 + tv_usec / 1000` (`src/main.cpp` lines 368–374). This is the single boundary-detection mechanism used everywhere.
+- On boot, the firmware waits for `getMsIntoMinute() < 1000` (i.e. the first second of a new minute) before starting (`src/main.cpp` lines 823–854)
 - `start_at_minute_pending` flag drives this wait; it is set on boot and whenever switching from a positioning mode back to a timekeeping mode. When the boundary fires, `pulseOnce()` fires the p59→p00 boundary tick, then `startNewMinute()` resets `pulse_index` and fills `tick_durations`. **p59 invariant**: the hand is always at p59 when this path runs. On boot the hand is assumed to be at p59. Calibrate positions 1–58 sprint to p59 via `pulse_index = position + 1`. Calibrate position 59 is already at p59. Positioning modes (sprint/crawl) transitioning to a timekeeping mode stop one pulse early (at p59) via an early-exit check before the final revolution pulse, so the boundary pulse fires correctly.
 
 ### Sprint and crawl (positioning modes)
@@ -120,9 +121,9 @@ Gravity mode simulates gravitational acceleration: the hand moves fast on the fa
 ### `pulse_index` invariant
 
 `pulse_index` must **only** be reset by:
-1. The `start` MQTT command (`src/main.cpp` line 342)
-2. `startNewMinute()` at each minute boundary (`src/main.cpp` line 551)
-3. The positioning-mode wrap in `loop()` (`src/main.cpp` line 737) — this is the only other reset, and it is intentional for sprint/crawl which run without NTP sync
+1. The `start` MQTT command (`src/main.cpp` line 422)
+2. `startNewMinute()` at each minute boundary (`src/main.cpp` line 687)
+  3. The positioning-mode wrap in `loop()` (`src/main.cpp` line 896) — this is the only other reset, and it is intentional for sprint/crawl which run without NTP sync
 4. The `calibrate <position>` MQTT command — for positions 0–58, sets `pulse_index` to `position + 1` so the sprint loop sends exactly the remaining pulses to land on p59 before re-sync. Position 59 skips sprint and waits directly. This is intentional: the user is asserting the physical hand position.
 
 It must never be reset elsewhere. This is a hard constraint from `AGENTS.md`.
@@ -140,7 +141,7 @@ On every boot and at every top-of-hour minute boundary, `selectRandomTimekeeping
 
 ### MQTT command handling
 
-All commands arrive on topic `clock/mode/set` via `onMqttMessage()` (`src/main.cpp` lines 322–488).
+All commands arrive on topic `clock/mode/set` via `onMqttMessage()` (`src/main.cpp` lines 402–596).
 
 Control commands (handled first, before mode parsing):
 
@@ -156,20 +157,27 @@ Mode commands (parsed by `stringToMode()` for bare names, or by prefix matching 
 
 - Positioning modes (`sprint`, `crawl`): applied immediately, all blocking state cleared; `positioning_tick_ms` is set to the default (`SPRINT_DEFAULT_MS` or `CRAWL_DEFAULT_MS`)
 - Positioning modes with duration (`sprint <ms>`, `crawl <ms>`): same as above, but `positioning_tick_ms` is set to the given value, clamped to a minimum of 100 ms
-- `rush_wait <ms>`: sets `rush_wait_tick_ms` to the given value (minimum 200 ms), then queues or applies the mode change as a normal timekeeping mode; bare `rush_wait` reverts `rush_wait_tick_ms` to `RUSH_WAIT_DEFAULT_MS` (932 ms)
+- `rush_wait <ms>`: sets `rush_wait_tick_ms` to the given value (minimum 200 ms), then queues or applies the mode change as a normal timekeeping mode; bare `rush_wait` reverts `rush_wait_tick_ms` to `RUSH_WAIT_DEFAULT_MS` (700 ms)
 - Timekeeping modes when `stopped`: applied immediately, `start_at_minute_pending = true`
 - Timekeeping modes when running: queued in `pending_mode` / `mode_change_pending`, applied at next revolution boundary via `onRevolutionComplete()`
 
 Current mode is published retained to `clock/mode/state` after every change.
 
-### MQTT idle window
+### MQTT reconnection strategy
 
-MQTT (re)connection is only attempted when `stopped` is true. Attempting reconnection while timekeeping risks `connectMqtt()` blocking through the p59 boundary window and missing the `getMsIntoMinute() < 500` pulse. `mqtt_client.loop()` still runs on every `loop()` iteration so message handling is unaffected — only reconnection is deferred until the clock is stopped (`src/main.cpp` lines 647–650).
+MQTT reconnection is attempted regardless of clock state, but uses a fast-fail TCP probe to avoid blocking the boundary pulse:
+
+1. Before calling `mqtt_client.connect()`, a throwaway `WiFiClient` probes the broker with a 100 ms timeout. If the broker is unreachable the probe fails fast and `connectMqtt()` returns immediately.
+2. The underlying `WiFiClient` socket timeout is set to 500 ms in `setup()`, so even if the probe succeeds but the CONNACK is slow, the handshake times out well within the ~940 ms gap between the boundary check and the next tick.
+3. The reconnect interval is 5 s when `stopped` and 60 s when running, keeping probe overhead negligible during timekeeping.
+4. `mqtt_client.loop()` runs on every `loop()` iteration so message handling is always live.
+
+Evidence: `src/main.cpp` lines 613–645 (`connectMqtt()`), lines 810–821 (`loop()` WiFi/MQTT block).
 
 ### GPIO drive strength
 
 - Both coil pins (GPIO 5 and 6) are set to `GPIO_DRIVE_CAP_0` (5 mA) — the minimum, because the 820 Ω series resistor limits current to ~4 mA at 3.3 V anyway.
-- Evidence: `src/main.cpp` lines 563–564
+- Evidence: `src/main.cpp` lines 713–714
 
 ### Error handling
 
@@ -208,7 +216,7 @@ No linting, formatting, or testing infrastructure. This is typical for embedded 
 
 ## Project structure hotspots
 
-- `src/main.cpp` (740 lines) — Full firmware: WiFi, NTP, MQTT, all tick modes, minute-boundary synchronization.
+- `src/main.cpp` (899 lines) — Full firmware: WiFi, NTP, MQTT, all tick modes, minute-boundary synchronization.
 - `platformio.ini` — Build configuration with two active environments (`sleight`, `sleight-ota`).
 - `README.md` — Comprehensive documentation of hardware, modes, MQTT API, and configuration constants.
 - `AGENTS.md` — Development constraints (especially the `pulse_index` reset rule) and documentation maintenance rules.
@@ -237,32 +245,32 @@ No linting, formatting, or testing infrastructure. This is typical for embedded 
 ### Do: Anchor all boundary detection to `getMsIntoMinute()`, not raw `millis()`
 
 All minute-boundary detection uses `getMsIntoMinute()` (which reads `gettimeofday()`), both for `start_at_minute_pending` and for the pulse-59 boundary wait. This avoids drift from loop jitter and eliminates the need for a `millis()`-based `minute_start_ms` variable.
-- Evidence: `src/main.cpp` lines 633, 654
+- Evidence: `src/main.cpp` lines 799, 825
 
-### Do: Defer blocking operations to the idle window
+### Do: Use a fast-fail TCP probe before MQTT reconnect
 
-MQTT reconnection only happens when `stopped`. The blocking `connect()` call cannot stall pulse timing while the clock is timekeeping.
-- Evidence: `src/main.cpp` lines 647–650
+MQTT reconnection uses a 100 ms TCP probe before calling `mqtt_client.connect()`, so the reconnect attempt fails fast when the broker is unreachable and never blocks the boundary pulse window.
+- Evidence: `src/main.cpp` lines 630–635 (`connectMqtt()` probe logic)
 
 ### Do: Apply timekeeping mode changes at revolution boundaries
 
 Timekeeping mode changes are queued in `pending_mode` / `mode_change_pending` and applied in `onRevolutionComplete()`, so the clock never starts a new mode mid-revolution.
-- Evidence: `src/main.cpp` lines 73–74, 480–482
+- Evidence: `src/main.cpp` lines 80–81, 485–486
 
 ### Do: Activate positioning modes immediately
 
 Positioning modes (`sprint`, `crawl`) bypass the revolution-boundary queue because they don't need NTP sync. All pending blocking state (`start_at_minute_pending`, `stop_at_top_pending`) is cleared.
-- Evidence: `src/main.cpp` lines 437–446
+- Evidence: `src/main.cpp` lines 537–547
 
 ### Do: Re-sync to NTP after leaving a positioning mode
 
 When switching from sprint/crawl back to a timekeeping mode, `onRevolutionComplete()` sets `start_at_minute_pending = true` so the clock waits for the next minute boundary.
-- Evidence: `src/main.cpp` lines 541–545
+- Evidence: `src/main.cpp` lines 677–681
 
 ### Do: Fall back to `last_timekeeping_mode` at minute boundary if in a positioning mode
 
 If `start_at_minute_pending` fires while `current_mode` is sprint or crawl, the clock falls back to `last_timekeeping_mode` rather than running an unsynchronized positioning mode.
-- Evidence: `src/main.cpp` lines 662–669
+- Evidence: `src/main.cpp` lines 833–840
 
 ### Don't: Reset `pulse_index` except in `start`, `startNewMinute()`, the positioning-mode wrap, or `calibrate`
 
@@ -272,7 +280,7 @@ Resetting `pulse_index` at any other point breaks NTP synchronization. This is a
 ### Don't: Block the main loop during active pulsing
 
 All delays are calculated from gap constants or `tick_durations[]`, not arbitrary waits. MQTT operations are deferred. The only intentional blocking `delay()` calls are the pulse duration itself and the inter-pulse gap.
-- Evidence: `src/main.cpp` lines 694, 733
+- Evidence: `src/main.cpp` lines 863, 893
 
 
 
