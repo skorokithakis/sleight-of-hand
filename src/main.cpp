@@ -15,10 +15,13 @@ constexpr uint16_t PULSES_PER_REVOLUTION = 60;
 
 constexpr uint32_t PULSE_MS = 31;
 
-constexpr uint32_t SPRINT_DEFAULT_MS = 300;
-constexpr uint32_t CRAWL_DEFAULT_MS = 2000;
 constexpr uint32_t CALIBRATE_SPRINT_MS = 200;
 constexpr uint16_t RUSH_WAIT_DEFAULT_MS = 700;
+
+// Sentinel value for calibration_target_minute meaning "no WAIT target set"
+// (i.e. SPRINT path). UINT32_MAX is used rather than 0 because 0 is a valid
+// 12h-cycle minute (12:00:00).
+constexpr uint32_t NO_CALIBRATION_TARGET = UINT32_MAX;
 
 constexpr uint8_t TICK_COUNT = 59;
 
@@ -41,6 +44,7 @@ constexpr uint16_t VETINARI_TEMPLATE[TICK_COUNT] = {
 uint16_t tick_durations[TICK_COUNT];
 
 constexpr char NTP_SERVER[] = "pool.ntp.org";
+// All internal time is UTC. `calibrate H:MM:SS` expects UTC, not local wall-clock time.
 constexpr long UTC_OFFSET_SECONDS = 0;
 
 // --- MQTT ---
@@ -72,8 +76,6 @@ enum class TickMode : uint8_t {
   hesitate,
   stumble,
   gravity,
-  sprint,
-  crawl,
 };
 
 TickMode current_mode = TickMode::vetinari;
@@ -94,14 +96,6 @@ constexpr TickMode TIMEKEEPING_MODES[] = {
 constexpr uint8_t TIMEKEEPING_MODE_COUNT =
     sizeof(TIMEKEEPING_MODES) / sizeof(TIMEKEEPING_MODES[0]);
 
-// Tracks the last timekeeping mode that was active, so that start_at_minute
-// can fall back to it if current_mode is a positioning mode when the minute
-// boundary fires. Overwritten immediately on boot by selectRandomTimekeepingMode().
-TickMode last_timekeeping_mode = TickMode::vetinari;
-
-// Set on every sprint/crawl activation; no default needed.
-uint32_t positioning_tick_ms = 0;
-
 // Per-tick duration for rush_wait mode. Adjusted via "rush_wait <ms>" MQTT
 // command; bare "rush_wait" resets it to the default.
 uint16_t rush_wait_tick_ms = RUSH_WAIT_DEFAULT_MS;
@@ -109,7 +103,12 @@ uint16_t rush_wait_tick_ms = RUSH_WAIT_DEFAULT_MS;
 // --- State ---
 
 bool polarity = false;
-uint16_t pulse_index = 0;
+
+// Seconds past 12:00:00 in a 12-hour cycle (0–43199). Incremented mod 43200
+// on every pulseOnce() call. The second-hand position within the current
+// minute is (displayed_time % 60). Starts at 0 on boot (wrong, but corrected
+// at the first NTP minute boundary via start_at_minute_pending).
+uint32_t displayed_time = 0;
 
 // When stopped, the loop does nothing. Used to manually position the hand
 // before restarting at a minute boundary.
@@ -119,17 +118,16 @@ bool stopped = false;
 // (i.e. when getMsIntoMinute() wraps past 0).
 bool start_at_minute_pending = false;
 
-// When true, the clock will stop after the current revolution completes
-// (at pulse 60, i.e. the hand is at 12 o'clock).
-bool stop_at_top_pending = false;
+// True while a calibration sprint is in progress. The main loop pulses at
+// CALIBRATE_SPRINT_MS until displayed_time catches up to NTP (SPRINT path)
+// or until p59 is reached (WAIT path).
+bool is_calibrating = false;
 
-// Set when a calibrate sprint is active. Calibrate sprints set pulse_index to
-// position + 1 (one ahead of the actual hand position), so the early-stop
-// check at pulse_index == PULSES_PER_REVOLUTION - 1 would fire one pulse too
-// early (leaving the hand at p58 instead of p59). When this flag is set, the
-// early-stop check is skipped and the existing pulse_index >= PULSES_PER_REVOLUTION
-// wrap handles the revolution end correctly (hand lands at p59).
-bool is_calibrate_sprint = false;
+// For the WAIT calibration path: the NTP time (as seconds in the 12h cycle,
+// with seconds component = 0) that start_at_minute_pending must match before
+// firing. NO_CALIBRATION_TARGET means SPRINT path (fire at the next minute
+// boundary as usual).
+uint32_t calibration_target_minute = NO_CALIBRATION_TARGET;
 
 // --- Logging ---
 
@@ -184,10 +182,6 @@ static const char* modeToString(TickMode mode) {
       return "stumble";
     case TickMode::gravity:
       return "gravity";
-    case TickMode::sprint:
-      return "sprint";
-    case TickMode::crawl:
-      return "crawl";
   }
   return "unknown";
 }
@@ -217,19 +211,7 @@ static bool stringToMode(const char* str, TickMode& out) {
     out = TickMode::gravity;
     return true;
   }
-  if (strcmp(str, "sprint") == 0) {
-    out = TickMode::sprint;
-    return true;
-  }
-  if (strcmp(str, "crawl") == 0) {
-    out = TickMode::crawl;
-    return true;
-  }
   return false;
-}
-
-static bool isTimekeeping(TickMode mode) {
-  return mode != TickMode::sprint && mode != TickMode::crawl;
 }
 
 // --- Coil drive ---
@@ -251,7 +233,7 @@ static void pulseOnce(uint32_t pulse_ms = PULSE_MS) {
   delay(pulse_ms);
   setCoilIdle();
   polarity = !polarity;
-  pulse_index++;
+  displayed_time = (displayed_time + 1) % 43200;
 }
 
 // Returns false and sets stopped=true if the sum of tick_durations exceeds
@@ -341,9 +323,6 @@ static void fillTickDurations() {
       }
       break;
     }
-    default:
-      // Positioning modes (sprint/crawl) don't use the tick_durations table.
-      break;
   }
   validateTickDurationsSum();
 }
@@ -373,6 +352,18 @@ static uint32_t getMsIntoMinute() {
   return (uint32_t)timeinfo.tm_sec * 1000 + (uint32_t)(tv.tv_usec / 1000);
 }
 
+// Returns the current NTP time as seconds past 12:00:00 in a 12-hour cycle
+// (0–43199). Used by calibration to compare against displayed_time.
+static uint32_t getNtpTimeIn12hCycle() {
+  struct timeval tv;
+  gettimeofday(&tv, nullptr);
+  struct tm timeinfo;
+  localtime_r(&tv.tv_sec, &timeinfo);
+  return (uint32_t)((timeinfo.tm_hour % 12) * 3600 +
+                    timeinfo.tm_min * 60 +
+                    timeinfo.tm_sec);
+}
+
 // --- MQTT ---
 
 static void publishCurrentMode() {
@@ -382,14 +373,13 @@ static void publishCurrentMode() {
   }
 }
 
-// Picks a random timekeeping mode, applies it to current_mode and
-// last_timekeeping_mode, resets rush_wait_tick_ms if needed, logs the
-// selection, and publishes via MQTT. Does not touch pulse_index.
+// Picks a random timekeeping mode, applies it to current_mode, resets
+// rush_wait_tick_ms if needed, logs the selection, and publishes via MQTT.
+// Does not touch displayed_time.
 static void selectRandomTimekeepingMode() {
   uint8_t index = (uint8_t)(esp_random() % TIMEKEEPING_MODE_COUNT);
   TickMode chosen = TIMEKEEPING_MODES[index];
   current_mode = chosen;
-  last_timekeeping_mode = chosen;
   if (chosen == TickMode::rush_wait) {
     // Mirror what the bare "rush_wait" MQTT command does: reset to the default
     // tick duration so the randomly-selected mode behaves predictably.
@@ -412,6 +402,8 @@ static void onMqttMessage(char* topic, byte* payload, unsigned int length) {
   if (strcmp(buffer, "stop") == 0) {
     stopped = true;
     start_at_minute_pending = false;
+    is_calibrating = false;
+    calibration_target_minute = NO_CALIBRATION_TARGET;
     logMessage("Clock stopped.");
     return;
   }
@@ -419,30 +411,99 @@ static void onMqttMessage(char* topic, byte* payload, unsigned int length) {
   if (strcmp(buffer, "start") == 0) {
     stopped = false;
     start_at_minute_pending = false;
-    pulse_index = 0;
-    is_calibrate_sprint = false;
+    displayed_time = 0;
+    is_calibrating = false;
+    calibration_target_minute = NO_CALIBRATION_TARGET;
     logMessage("Clock started immediately.");
     return;
   }
 
   if (strcmp(buffer, "start_at_minute") == 0) {
+    // Cancelling calibration here is intentional: if the hand isn't at p59,
+    // letting the boundary pulse fire from the wrong position would violate the
+    // p59 invariant. The user is explicitly overriding whatever was in progress.
+    is_calibrating = false;
+    calibration_target_minute = NO_CALIBRATION_TARGET;
     start_at_minute_pending = true;
-    stop_at_top_pending = false;
     logMessage("Clock will start at next minute boundary.");
     return;
   }
 
-  if (strcmp(buffer, "stop_at_top") == 0) {
-    stop_at_top_pending = true;
-    start_at_minute_pending = false;
-    logMessage("Clock will stop at top of next revolution.");
-    return;
-  }
-
   if (strncmp(buffer, "calibrate ", 10) == 0) {
+    const char* arg = buffer + 10;
+
+    // Try to parse as H:MM:SS (flexible hour: 1 or 2 digits, mandatory 2-digit
+    // MM and SS). If that fails, fall through to the legacy position parser.
+    uint32_t parsed_hour = 0;
+    uint32_t parsed_min = 0;
+    uint32_t parsed_sec = 0;
+    char* endptr_h;
+    parsed_hour = (uint32_t)strtoul(arg, &endptr_h, 10);
+    bool is_hmmss = false;
+    if (endptr_h != arg && *endptr_h == ':') {
+      char* endptr_m;
+      parsed_min = (uint32_t)strtoul(endptr_h + 1, &endptr_m, 10);
+      if (endptr_m != endptr_h + 1 && *endptr_m == ':') {
+        char* endptr_s;
+        parsed_sec = (uint32_t)strtoul(endptr_m + 1, &endptr_s, 10);
+        if (endptr_s != endptr_m + 1 && *endptr_s == '\0') {
+          // Validate ranges.
+          if (parsed_min < 60 && parsed_sec < 60) {
+            is_hmmss = true;
+          }
+        }
+      }
+    }
+
+    if (is_hmmss) {
+      // Cancel any in-progress calibration unconditionally before doing
+      // anything else, including the early-return for d==0. This ensures a
+      // new calibrate command always supersedes the previous one cleanly.
+      is_calibrating = false;
+      calibration_target_minute = NO_CALIBRATION_TARGET;
+
+      // Set displayed_time from the parsed H:MM:SS, anchored to the 12h cycle.
+      displayed_time = (uint32_t)((parsed_hour % 12) * 3600 +
+                                  parsed_min * 60 +
+                                  parsed_sec);
+
+      uint32_t ntp_time = getNtpTimeIn12hCycle();
+      uint32_t forward_distance = (ntp_time - displayed_time + 43200) % 43200;
+
+      if (forward_distance == 0) {
+        logMessage("Calibrate H:MM:SS: already correct, no calibration needed.");
+        return;
+      }
+
+      // Start fresh calibration.
+      is_calibrating = true;
+      mode_change_pending = false;
+      stopped = false;
+      start_at_minute_pending = false;
+
+      if (forward_distance <= 10800) {
+        // SPRINT path: sprint forward until displayed_time catches up to NTP.
+        // calibration_target_minute stays NO_CALIBRATION_TARGET.
+        logMessagef("Calibrate H:MM:SS: sprinting to NTP (distance=%lus).",
+                    (unsigned long)forward_distance);
+      } else {
+        // WAIT path: sprint to p59 within the current minute, then wait for
+        // the specific NTP minute boundary where displayed_time will match.
+        // The target is the minute after the one we'll be at when we reach p59.
+        // Since p59 is second 59 of the current displayed minute, the next
+        // minute boundary is (displayed_time/60 + 1)*60.
+        calibration_target_minute = ((displayed_time / 60 + 1) * 60) % 43200;
+        logMessagef("Calibrate H:MM:SS: WAIT path, sprinting to p59 then waiting for minute %lus.",
+                    (unsigned long)calibration_target_minute);
+      }
+      publishCurrentMode();
+      return;
+    }
+
+    // Legacy position parser: "calibrate <position>".
     char* endptr;
-    uint32_t position = (uint32_t)strtoul(buffer + 10, &endptr, 10);
-    if (endptr == buffer + 10) {
+    uint32_t position = (uint32_t)strtoul(arg, &endptr, 10);
+    if (endptr == arg) {
       logMessagef("Unknown command: %s", buffer);
       return;
     }
@@ -450,76 +511,66 @@ static void onMqttMessage(char* topic, byte* payload, unsigned int length) {
       logMessagef("Unknown command: %s", buffer);
       return;
     }
+
+    // Set displayed_time anchored to the current NTP hour and minute.
+    struct timeval calibrate_tv;
+    gettimeofday(&calibrate_tv, nullptr);
+    struct tm calibrate_tm;
+    localtime_r(&calibrate_tv.tv_sec, &calibrate_tm);
+
+    // Cancel any in-progress calibration unconditionally before doing anything
+    // else. This ensures a new calibrate command always supersedes the previous
+    // one cleanly, including the position-59 early-return path below.
+    is_calibrating = false;
+    calibration_target_minute = NO_CALIBRATION_TARGET;
+
     if (position == 59) {
       // Already at p59, which is the desired pre-boundary calibrate position.
+      displayed_time = (uint32_t)((calibrate_tm.tm_hour % 12) * 3600 +
+                                  calibrate_tm.tm_min * 60 + 59);
       stopped = true;
       start_at_minute_pending = true;
-      stop_at_top_pending = false;
       mode_change_pending = false;
-      is_calibrate_sprint = false;
       logMessage("Calibrate: at p59, waiting for minute boundary.");
-    } else {
-      // Set pulse_index to one step past the known position so the sprint loop
-      // sends exactly enough pulses to land on p59 (not p00) before waiting
-      // for the minute boundary tick to move to p00. This is one of
-      // the four sanctioned pulse_index reset points (see ARCHITECTURE.md).
-      pulse_index = (uint16_t)(position + 1);
-
-      // Parse an optional delay_ms after the position. We store delay_ms +
-      // PULSE_MS because the sprint loop does delay(positioning_tick_ms -
-      // PULSE_MS), so adding PULSE_MS here cancels out and delivers the exact
-      // raw inter-pulse delay the user requested.
-      uint32_t delay_ms = 0;
-      bool has_custom_delay = false;
-      if (*endptr == ' ') {
-        char* delay_endptr;
-        delay_ms = (uint32_t)strtoul(endptr + 1, &delay_endptr, 10);
-        has_custom_delay = (delay_endptr != endptr + 1);
-      }
-      positioning_tick_ms = has_custom_delay ? delay_ms + PULSE_MS : CALIBRATE_SPRINT_MS;
-
-      current_mode = TickMode::sprint;
-      stopped = false;
-      start_at_minute_pending = false;
-      stop_at_top_pending = false;
-      pending_mode = last_timekeeping_mode;
-      mode_change_pending = true;
-      is_calibrate_sprint = true;
-      if (has_custom_delay) {
-        logMessagef("Calibrate: sprinting from p%02u to p59 at %ums delay, then resuming %s.",
-                    position, delay_ms, modeToString(last_timekeeping_mode));
-      } else {
-        logMessagef("Calibrate: sprinting from p%02u to p59, then resuming %s.",
-                    position, modeToString(last_timekeeping_mode));
-      }
-      publishCurrentMode();
+      return;
     }
+
+    // For positions 0–58: set displayed_time so that displayed_time % 60 ==
+    // position. The calibration branch stops at displayed_time % 60 == 59
+    // WITHOUT pulsing, so starting at position fires exactly (59 - position)
+    // pulses to land on p59.
+    displayed_time = (uint32_t)((calibrate_tm.tm_hour % 12) * 3600 +
+                                calibrate_tm.tm_min * 60 + position);
+
+    uint32_t ntp_time = getNtpTimeIn12hCycle();
+    uint32_t forward_distance = (ntp_time - displayed_time + 43200) % 43200;
+
+    // Start fresh calibration.
+    is_calibrating = true;
+    mode_change_pending = false;
+    stopped = false;
+    start_at_minute_pending = false;
+
+    if (forward_distance <= 10800) {
+      // calibration_target_minute stays NO_CALIBRATION_TARGET (SPRINT path).
+      logMessagef("Calibrate p%02u: sprinting to NTP (distance=%lus).",
+                  position, (unsigned long)forward_distance);
+    } else {
+      calibration_target_minute = ((displayed_time / 60 + 1) * 60) % 43200;
+      logMessagef("Calibrate p%02u: WAIT path, sprinting to p59 then waiting for minute %lus.",
+                  position, (unsigned long)calibration_target_minute);
+    }
+    publishCurrentMode();
     return;
   }
 
-  // Check for positioning modes with an optional tick-duration parameter
-  // (e.g. "sprint 150" or "crawl 500"). This must happen before stringToMode()
-  // so the bare name still works for all other callers of stringToMode().
-  TickMode parameterized_mode;
-  bool has_parameterized_mode = false;
-  if (strncmp(buffer, "sprint ", 7) == 0) {
-    parameterized_mode = TickMode::sprint;
-    has_parameterized_mode = true;
-    uint32_t requested_ms = (uint32_t)strtoul(buffer + 7, nullptr, 10);
-    positioning_tick_ms = requested_ms < 100 ? 100 : requested_ms;
-  } else if (strncmp(buffer, "crawl ", 6) == 0) {
-    parameterized_mode = TickMode::crawl;
-    has_parameterized_mode = true;
-    uint32_t requested_ms = (uint32_t)strtoul(buffer + 6, nullptr, 10);
-    positioning_tick_ms = requested_ms < 100 ? 100 : requested_ms;
-  } else if (strncmp(buffer, "rush_wait ", 10) == 0) {
+  if (strncmp(buffer, "rush_wait ", 10) == 0) {
     // rush_wait is a timekeeping mode, so it must queue at revolution
-    // boundaries rather than activate immediately like sprint/crawl.
+    // boundaries rather than activate immediately.
     uint32_t requested_ms = (uint32_t)strtoul(buffer + 10, nullptr, 10);
     rush_wait_tick_ms = (uint16_t)(requested_ms < 200 ? 200 : requested_ms);
     if (stopped) {
       current_mode = TickMode::rush_wait;
-      last_timekeeping_mode = TickMode::rush_wait;
       mode_change_pending = false;
       start_at_minute_pending = true;
       logMessagef("Mode changed to: rush_wait (starting at next minute boundary, tick=%ums)",
@@ -534,39 +585,9 @@ static void onMqttMessage(char* topic, byte* payload, unsigned int length) {
     return;
   }
 
-  if (has_parameterized_mode) {
-    current_mode = parameterized_mode;
-    mode_change_pending = false;
-    is_calibrate_sprint = false;
-    stopped = false;
-    start_at_minute_pending = false;
-    stop_at_top_pending = false;
-    logMessagef("Mode changed to: %s (immediate, tick=%ums)",
-                modeToString(parameterized_mode), positioning_tick_ms);
-    publishCurrentMode();
-    return;
-  }
-
   TickMode requested;
   if (stringToMode(buffer, requested)) {
-    if (!isTimekeeping(requested)) {
-      // Positioning modes activate immediately because they don't need NTP
-      // synchronization. Any pending blocking state is superseded: the user
-      // explicitly chose a positioning mode, so waiting for a minute boundary
-      // or a stop-at-top would prevent it from ever starting.
-      positioning_tick_ms = (requested == TickMode::sprint)
-                                ? SPRINT_DEFAULT_MS
-                                : CRAWL_DEFAULT_MS;
-      current_mode = requested;
-      mode_change_pending = false;
-      is_calibrate_sprint = false;
-      stopped = false;
-      start_at_minute_pending = false;
-      stop_at_top_pending = false;
-      logMessagef("Mode changed to: %s (immediate, tick=%ums)",
-                  modeToString(requested), positioning_tick_ms);
-      publishCurrentMode();
-    } else if (stopped) {
+    if (stopped) {
       // No revolution to wait for, so apply the mode immediately and wait for
       // the next minute boundary to start synchronized.
       if (requested == TickMode::rush_wait) {
@@ -574,7 +595,6 @@ static void onMqttMessage(char* topic, byte* payload, unsigned int length) {
         rush_wait_tick_ms = RUSH_WAIT_DEFAULT_MS;
       }
       current_mode = requested;
-      if (isTimekeeping(current_mode)) last_timekeeping_mode = current_mode;
       mode_change_pending = false;
       start_at_minute_pending = true;
       logMessagef("Mode changed to: %s (starting at next minute boundary)",
@@ -655,36 +675,32 @@ static void onSaveConfig() {
 // Called when the revolution completes (60 pulses done) to apply any pending
 // mode change before the idle gap.
 static void onRevolutionComplete() {
-  is_calibrate_sprint = false;
-
-  if (stop_at_top_pending) {
-    stop_at_top_pending = false;
-    stopped = true;
-    logMessage("Clock stopped at top.");
-    return;
-  }
-
   if (mode_change_pending) {
-    TickMode old_mode = current_mode;
     current_mode = pending_mode;
-    if (isTimekeeping(current_mode)) last_timekeeping_mode = current_mode;
     mode_change_pending = false;
     logMessagef("Mode changed to: %s", modeToString(current_mode));
     publishCurrentMode();
-
-    // When switching from a positioning mode to a timekeeping mode, wait for
-    // the next minute boundary to re-sync.
-    if (!isTimekeeping(old_mode) && isTimekeeping(current_mode)) {
-      stopped = true;
-      start_at_minute_pending = true;
-      logMessage("Waiting for minute boundary to re-sync.");
-    }
   }
 }
 
 // Called at each minute boundary to reset state for the new minute.
-static void startNewMinute() {
-  pulse_index = 0;
+// set_displayed_time_from_ntp is true when called from the
+// start_at_minute_pending path (boot or re-sync after calibration), where
+// we want to anchor displayed_time to the actual NTP time. On regular per-minute
+// boundaries the boundary pulse already incremented displayed_time correctly, so
+// no reset is needed.
+static void startNewMinute(bool set_displayed_time_from_ntp) {
+  if (set_displayed_time_from_ntp) {
+    // The boundary pulse just fired, so the hand is now at p00. Read NTP to
+    // anchor displayed_time to the real hour and minute. Seconds are 0 because
+    // this fires at a minute boundary.
+    struct timeval ntp_tv;
+    gettimeofday(&ntp_tv, nullptr);
+    struct tm ntp_tm;
+    localtime_r(&ntp_tv.tv_sec, &ntp_tm);
+    displayed_time = (uint32_t)((ntp_tm.tm_hour % 12) * 3600 +
+                                ntp_tm.tm_min * 60);
+  }
 
   // At the top of every hour, pick a new random timekeeping mode before
   // filling the tick table. This means the new mode is in effect for the
@@ -795,13 +811,13 @@ void loop() {
   // Check the minute boundary first, before any potentially-blocking MQTT
   // work. This ensures the boundary pulse fires as soon as the NTP second
   // rolls over, regardless of MQTT state.
-  if (isTimekeeping(current_mode) && pulse_index == 59 && !stopped) {
+  if ((displayed_time % 60) == 59 && !stopped && !is_calibrating) {
     if (getMsIntoMinute() < 500) {
       pulseOnce();
       logBoundaryPulse();
       onRevolutionComplete();
       if (!stopped) {
-        startNewMinute();
+        startNewMinute(false);
       }
       return;
     }
@@ -821,33 +837,34 @@ void loop() {
   }
 
   if (start_at_minute_pending) {
-    // Poll NTP until the second rolls over to 0, then start.
+    // Poll NTP until the second rolls over to 0, then start. When
+    // calibration_target_minute is set (WAIT path), only fire at the specific
+    // target minute rather than the next available minute boundary.
     if (getMsIntoMinute() < 1000) {
+      if (calibration_target_minute != NO_CALIBRATION_TARGET) {
+        uint32_t ntp_minute = getNtpTimeIn12hCycle();
+        // Strip seconds to get the minute boundary value.
+        ntp_minute = (ntp_minute / 60) * 60;
+        if (ntp_minute != calibration_target_minute) {
+          return;
+        }
+        calibration_target_minute = NO_CALIBRATION_TARGET;
+      }
       if (mode_change_pending) {
         current_mode = pending_mode;
-        if (isTimekeeping(current_mode)) last_timekeeping_mode = current_mode;
         mode_change_pending = false;
         logMessagef("Mode changed to: %s", modeToString(current_mode));
-        publishCurrentMode();
-      }
-      if (!isTimekeeping(current_mode)) {
-        // If the user was in a positioning mode when the minute boundary fires,
-        // fall back to the last timekeeping mode so the clock actually keeps
-        // time rather than running in an unsynchronized positioning mode.
-        current_mode = last_timekeeping_mode;
-        logMessagef("Falling back to last timekeeping mode: %s",
-                    modeToString(current_mode));
         publishCurrentMode();
       }
       stopped = false;
       start_at_minute_pending = false;
       // Fire the p59→p00 boundary pulse before starting the new minute.
       // The hand is always at p59 when this path runs: on boot the hand is
-      // assumed to be at p59, and calibrate/positioning modes sprint to p59
-      // before setting start_at_minute_pending.
+      // assumed to be at p59, and calibration sprints to p59 before setting
+      // start_at_minute_pending.
       pulseOnce();
       logBoundaryPulse();
-      startNewMinute(); // pulse_index = 0, fill tick_durations
+      startNewMinute(true); // set displayed_time from NTP, fill tick_durations
       logMessage("Minute boundary reached, clock started.");
     }
     return;
@@ -857,43 +874,47 @@ void loop() {
     return;
   }
 
-  if (isTimekeeping(current_mode)) {
-    if (pulse_index < 59) {
-      uint16_t duration = tick_durations[pulse_index];
-      delay(duration - PULSE_MS);
-      pulseOnce();
-    }
-    // pulse_index == 59: the boundary check at the top of loop() handles this
-    // case; nothing to do here.
-  } else {
-    // Positioning modes (sprint/crawl) run continuously without NTP sync.
-    // Both modes share the same structure; only the tick duration differs,
-    // and that is already stored in positioning_tick_ms.
+  // Calibration sprint: pulse at CALIBRATE_SPRINT_MS until displayed_time
+  // catches up to NTP (SPRINT path) or until p59 is reached (WAIT path).
+  if (is_calibrating) {
+    uint8_t seconds = (uint8_t)(displayed_time % 60);
 
-    // When the hand is one pulse away from completing a revolution AND a
-    // timekeeping mode change is pending, skip the final pulse (p59→p00) so
-    // the hand stops at p59. start_at_minute_pending will then fire the
-    // p59→p00 boundary pulse at the correct NTP moment. Without this check,
-    // the revolution would complete to p00, violating the invariant that the
-    // hand is always at p59 when start_at_minute_pending fires.
-    //
-    // Calibrate sprints are excluded: they set pulse_index = position + 1
-    // (one ahead of the actual hand position), so this check would fire one
-    // pulse too early (hand at p58 instead of p59). The existing
-    // pulse_index >= PULSES_PER_REVOLUTION wrap handles calibrate sprints
-    // correctly (the sprint fires exactly enough pulses to land at p59).
-    if (!is_calibrate_sprint && !stop_at_top_pending &&
-        pulse_index == PULSES_PER_REVOLUTION - 1 &&
-        mode_change_pending && isTimekeeping(pending_mode)) {
-      onRevolutionComplete();
-      return;
+    if (seconds == 59) {
+      if (calibration_target_minute != NO_CALIBRATION_TARGET) {
+        // WAIT path: we've reached p59. Stop and wait for the target minute.
+        is_calibrating = false;
+        stopped = true;
+        start_at_minute_pending = true;
+        logMessagef("Calibration reached p59, waiting for minute %lus.",
+                    (unsigned long)calibration_target_minute);
+        return;
+      }
+
+      // SPRINT path: check if displayed_time has caught up to or passed NTP.
+      // A forward distance > 21600 (half the 12h cycle) means displayed_time
+      // is now ahead of NTP — we've overshot. Distance == 0 means exact match.
+      uint32_t ntp_time = getNtpTimeIn12hCycle();
+      uint32_t forward_distance = (ntp_time - displayed_time + 43200) % 43200;
+      if (forward_distance == 0 || forward_distance > 21600) {
+        is_calibrating = false;
+        stopped = true;
+        start_at_minute_pending = true;
+        logMessage("Calibration sprint complete, waiting for minute boundary.");
+        return;
+      }
+      // Still behind NTP; continue sprinting through another revolution.
     }
 
     pulseOnce();
-    delay(positioning_tick_ms - PULSE_MS);
-    if (pulse_index >= PULSES_PER_REVOLUTION) {
-      onRevolutionComplete();
-      pulse_index = 0;
-    }
+    delay(CALIBRATE_SPRINT_MS - PULSE_MS);
+    return;
   }
+
+  if ((displayed_time % 60) < 59) {
+    uint16_t duration = tick_durations[displayed_time % 60];
+    delay(duration - PULSE_MS);
+    pulseOnce();
+  }
+  // (displayed_time % 60) == 59: the boundary check at the top of loop()
+  // handles this case; nothing to do here.
 }

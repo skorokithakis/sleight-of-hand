@@ -1,6 +1,6 @@
 ---
 id: soh-zbhj
-status: open
+status: closed
 deps: []
 links: []
 created: 2026-03-29T23:30:34Z

@@ -9,7 +9,7 @@ reflect the new state.
 
 ## Code concerns
 
-- `pulse_index` should never be reset, except by the `start` MQTT command.
+- `displayed_time` should never be explicitly set, except by the `start` MQTT command, `startNewMinute(true)` (NTP-anchored boundary), or the `calibrate` command. All other changes happen via `pulseOnce()` incrementing it.
 
 ## Documentation maintenance
 

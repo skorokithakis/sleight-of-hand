@@ -97,14 +97,9 @@ Each timekeeping mode defines the 59-element `tick_durations` array.
 | `vetinari` | 59 ticks with shuffled irregular durations (534–2001 ms). The hand visibly speeds up and slows down, but completes the minute on time. Reshuffled every minute. |
 | `hesitate` | 58 ticks at 980 ms, 1 tick at 2000 ms, shuffled each minute. The hand pauses for ~2 seconds at a random position each minute, creating a noticeable hesitation somewhere in the revolution. |
 | `stumble` | 58 ticks at 1010 ms, 1 tick at 420 ms, shuffled each minute. The hand skips forward quickly at a random position each minute, as if stumbling. |
-| `sprint` | Continuous ticking at a configurable duration (default 300 ms per tick). For quickly advancing the hand to a target position. Activates immediately; not NTP-anchored. |
-| `crawl` | Continuous ticking at a configurable duration (default 2000 ms per tick). For precisely positioning the hand at 12 o'clock. Activates immediately; not NTP-anchored. |
+| `gravity` | 59 ticks computed from pendulum physics. Fast near 6 o'clock (~500 ms), slow near 12 o'clock (~3150 ms). Not shuffled — the speed difference is tied to the dial position. |
 
-Sprint and crawl are positioning modes, not timekeeping modes. When switching
-from either back to a timed mode, the clock waits for the next NTP minute
-boundary to re-sync.
-
-On every boot and at every top-of-hour minute boundary, the clock picks a random timekeeping mode. Manual MQTT mode changes still work as before; the next hour boundary overrides them.
+On every boot and at every top-of-hour minute boundary, the clock picks a random mode. Manual MQTT mode changes still work; the next hour boundary overrides them.
 
 
 ## MQTT
@@ -115,41 +110,43 @@ The clock subscribes to `clock/mode/set` and publishes the current mode to
 ### Changing modes
 
 ```sh
-mosquitto_pub -h <broker> -t clock/mode/set -m "rush_wait"
 mosquitto_pub -h <broker> -t clock/mode/set -m "steady"
+mosquitto_pub -h <broker> -t clock/mode/set -m "rush_wait"
 mosquitto_pub -h <broker> -t clock/mode/set -m "vetinari"
 mosquitto_pub -h <broker> -t clock/mode/set -m "hesitate"
 mosquitto_pub -h <broker> -t clock/mode/set -m "stumble"
-mosquitto_pub -h <broker> -t clock/mode/set -m "sprint"
-mosquitto_pub -h <broker> -t clock/mode/set -m "crawl"
+mosquitto_pub -h <broker> -t clock/mode/set -m "gravity"
 
-# Sprint and crawl accept an optional tick duration in milliseconds (minimum 100 ms).
-# Without a parameter the defaults (300 ms and 2000 ms) are used.
-mosquitto_pub -h <broker> -t clock/mode/set -m "sprint 150"
-mosquitto_pub -h <broker> -t clock/mode/set -m "crawl 500"
+# rush_wait accepts an optional tick duration in milliseconds (minimum 200 ms).
+# Without a parameter the default (700 ms) is used.
+mosquitto_pub -h <broker> -t clock/mode/set -m "rush_wait 500"
 ```
 
 Mode changes take effect when the current revolution completes (after 60
-ticks), except sprint and crawl which activate immediately.
+ticks).
 
 ### Control commands
 
 | Command | Description |
 |---|---|
-| `stop` | Halts ticking immediately. Use to manually position the hand. |
-| `stop_at_top` | Finishes the current minute's ticks, then stops with the hand at 12 o'clock. Safe to power off after this. Mutually exclusive with `start_at_minute`. |
-| `start` | Starts ticking immediately from tick 0, anchoring the minute to now. |
-| `start_at_minute` | Waits for the next NTP minute boundary, then starts from tick 0. Position the hand at 12, send this command, and the clock begins exactly on the minute. Mutually exclusive with `stop_at_top`. |
+| `stop` | Halts ticking immediately. Cancels any in-progress calibration. |
+| `start` | Starts ticking immediately from tick 0. Cancels any in-progress calibration. |
+| `start_at_minute` | Waits for the next NTP minute boundary, then starts from tick 0. Position the hand at 12, send this command, and the clock begins exactly on the minute. Cancels any in-progress calibration. |
+| `calibrate <position>` | Tell the clock the second hand is at position (0–59). The clock sprints to p59 and re-syncs to NTP at the next minute boundary. Uses the current NTP hour and minute to determine the full displayed time. |
+| `calibrate H:MM:SS` | Tell the clock the full time it's displaying (in UTC). The clock converges to NTP time: if ≤3 hours behind it sprints forward, if >3 hours behind it sprints to p59 and waits for NTP to catch up. |
 
 ```sh
-# Stop the clock to position the hand
+# Stop the clock to manually position the hand
 mosquitto_pub -h <broker> -t clock/mode/set -m "stop"
 
-# Stop the clock at 12 o'clock (safe to power off)
-mosquitto_pub -h <broker> -t clock/mode/set -m "stop_at_top"
-
-# Start at the next minute boundary
+# Start at the next minute boundary (hand must be at 12 o'clock)
 mosquitto_pub -h <broker> -t clock/mode/set -m "start_at_minute"
+
+# Tell the clock the second hand is at the 45-second mark
+mosquitto_pub -h <broker> -t clock/mode/set -m "calibrate 45"
+
+# Tell the clock it's showing 3:22:15 UTC
+mosquitto_pub -h <broker> -t clock/mode/set -m "calibrate 3:22:15"
 ```
 
 MQTT reconnection attempts only happen during the idle gap at the minute
@@ -177,5 +174,5 @@ Constants at the top of `src/main.cpp`:
 | `PULSE_MS` | 31 | Coil pulse duration in ms |
 | `PULSES_PER_REVOLUTION` | 60 | Ticks per full revolution of the second hand |
 | `TICK_COUNT` | 59 | Number of ticks governed by the tick duration table per minute |
-| `SPRINT_DEFAULT_MS` | 300 | Default total tick duration in sprint mode when no parameter is given |
-| `CRAWL_DEFAULT_MS` | 2000 | Default total tick duration in crawl mode when no parameter is given |
+| `CALIBRATE_SPRINT_MS` | 200 | Tick duration during calibration sprints |
+| `UTC_OFFSET_SECONDS` | 0 | Timezone offset from UTC. All times (including `calibrate H:MM:SS`) use this. |
